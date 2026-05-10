@@ -37,6 +37,15 @@ int ds4_gpu_synchronize(void);
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
+#ifdef __APPLE__
+/* Metal wraps large GGUF tensor data as overlapping no-copy MTLBuffers.  This
+ * extension lets the engine size the overlap from the actual largest tensor. */
+int ds4_gpu_set_model_map_range_with_max_tensor(const void *model_map,
+                                                uint64_t model_size,
+                                                uint64_t map_offset,
+                                                uint64_t map_size,
+                                                uint64_t max_tensor_bytes);
+#endif
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 void ds4_gpu_set_quality(bool quality);

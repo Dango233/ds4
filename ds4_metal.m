@@ -187,7 +187,7 @@ static void ds4_gpu_print_device_summary(void) {
 }
 
 #define DS4_METAL_MAX_MODEL_VIEWS 16
-#define DS4_METAL_MODEL_MAX_TENSOR_BYTES 704643072ull
+#define DS4_METAL_MODEL_VIEW_FALLBACK_TENSOR_BYTES 704643072ull
 
 typedef struct {
     __strong id<MTLBuffer> buffer;
@@ -195,6 +195,7 @@ typedef struct {
     uint64_t model_size;
     uint64_t model_offset;
     uint64_t bytes;
+    uint64_t max_tensor_bytes;
 } ds4_gpu_model_view;
 
 static ds4_gpu_model_view g_model_views[DS4_METAL_MAX_MODEL_VIEWS];
@@ -351,6 +352,7 @@ static void ds4_gpu_model_views_clear(void) {
         g_model_views[i].model_size = 0;
         g_model_views[i].model_offset = 0;
         g_model_views[i].bytes = 0;
+        g_model_views[i].max_tensor_bytes = 0;
     }
     g_model_view_count = 0;
 }
@@ -409,7 +411,8 @@ static int ds4_gpu_map_model_views(
         const void *model_map,
         uint64_t    model_size,
         uint64_t    map_offset,
-        uint64_t    map_size) {
+        uint64_t    map_size,
+        uint64_t    max_tensor_bytes) {
     const double t0 = ds4_gpu_now_ms();
     const uint64_t page = (uint64_t)getpagesize();
     const uintptr_t model_addr = (uintptr_t)model_map;
@@ -445,9 +448,19 @@ static int ds4_gpu_map_model_views(
      * inside at least one view, so hot paths pass one buffer and one inner byte
      * offset. We never split a weight tensor across command encoders.
      */
-    const uint64_t overlap = round_up_u64(DS4_METAL_MODEL_MAX_TENSOR_BYTES, page) + page;
+    if (max_tensor_bytes < DS4_METAL_MODEL_VIEW_FALLBACK_TENSOR_BYTES) {
+        max_tensor_bytes = DS4_METAL_MODEL_VIEW_FALLBACK_TENSOR_BYTES;
+    }
+    if (max_tensor_bytes > UINT64_MAX - page) {
+        fprintf(stderr, "ds4: Metal model tensor size is too large for model views\n");
+        return 0;
+    }
+    const uint64_t overlap = round_up_u64(max_tensor_bytes, page) + page;
     if (max_buffer == 0 || max_buffer <= overlap) {
-        fprintf(stderr, "ds4: Metal maxBufferLength is too small for DS4 model views\n");
+        fprintf(stderr,
+                "ds4: Metal maxBufferLength %.2f GiB is too small for largest model tensor %.2f GiB\n",
+                (double)max_buffer / (1024.0 * 1024.0 * 1024.0),
+                (double)max_tensor_bytes / (1024.0 * 1024.0 * 1024.0));
         return 0;
     }
 
@@ -480,6 +493,7 @@ static int ds4_gpu_map_model_views(
         g_model_views[g_model_view_count].model_size = model_size;
         g_model_views[g_model_view_count].model_offset = page_model_offset + off;
         g_model_views[g_model_view_count].bytes = view_bytes;
+        g_model_views[g_model_view_count].max_tensor_bytes = max_tensor_bytes;
         g_model_view_count++;
 
         g_model_wrap_count++;
@@ -520,12 +534,14 @@ static int ds4_gpu_map_model_views(
     }
     const double t_warm = ds4_gpu_now_ms();
     fprintf(stderr,
-            "ds4: Metal model views created in %.3f ms, residency requested in %.3f ms, warmup %.3f ms (mapped %.2f MiB from offset %.2f MiB)\n",
+            "ds4: Metal model views created in %.3f ms, residency requested in %.3f ms, warmup %.3f ms (mapped %.2f MiB from offset %.2f MiB, largest tensor %.2f MiB, overlap %.2f MiB)\n",
             t_mapped - t0,
             t_resident - t_mapped,
             t_warm - t_warm0,
             mapped_model_size / 1024.0 / 1024.0,
-            page_model_offset / 1024.0 / 1024.0);
+            page_model_offset / 1024.0 / 1024.0,
+            max_tensor_bytes / 1024.0 / 1024.0,
+            overlap / 1024.0 / 1024.0);
     if (!warmed) return 0;
     return 1;
 }
@@ -4357,7 +4373,11 @@ int ds4_gpu_embed_tokens_hc_tensor(
     return 1;
 }
 
-int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
+int ds4_gpu_set_model_map_range_with_max_tensor(const void *model_map,
+                                                uint64_t model_size,
+                                                uint64_t map_offset,
+                                                uint64_t map_size,
+                                                uint64_t max_tensor_bytes) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!model_map || model_size == 0) return 0;
     if (map_offset > model_size || map_size == 0 || map_size > model_size - map_offset) return 0;
@@ -4366,6 +4386,7 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
         for (uint32_t i = 0; i < g_model_view_count; i++) {
             if (g_model_views[i].model_map == model_map &&
                 g_model_views[i].model_size == model_size &&
+                g_model_views[i].max_tensor_bytes >= max_tensor_bytes &&
                 map_offset >= g_model_views[i].model_offset &&
                 map_offset + map_size <= g_model_views[i].model_offset + g_model_views[i].bytes) {
                 return 1;
@@ -4377,7 +4398,7 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
         g_model_map_size = model_size;
         g_model_mapped_offset = map_offset;
         g_model_mapped_size = map_size;
-        if (!ds4_gpu_map_model_views(model_map, model_size, map_offset, map_size)) {
+        if (!ds4_gpu_map_model_views(model_map, model_size, map_offset, map_size, max_tensor_bytes)) {
             ds4_gpu_model_residency_clear();
             return 0;
         }
@@ -4386,6 +4407,10 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
                 g_model_view_count);
         return 1;
     }
+}
+
+int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
+    return ds4_gpu_set_model_map_range_with_max_tensor(model_map, model_size, map_offset, map_size, 0);
 }
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {

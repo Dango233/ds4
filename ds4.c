@@ -922,6 +922,7 @@ typedef struct {
     uint64_t n_tensors;
     uint64_t alignment;
     uint64_t tensor_data_pos;
+    uint64_t max_tensor_bytes;
 
     ds4_kv *kv;
     ds4_tensor *tensors;
@@ -1171,6 +1172,7 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
                 "ds4: warning: tensor %.*s has unsupported GGUF type %u\n",
                 (int)t->name.len, t->name.ptr, t->type);
         }
+        if (t->bytes > m->max_tensor_bytes) m->max_tensor_bytes = t->bytes;
     }
 
     m->tensor_data_pos = align_up(c->pos, m->alignment);
@@ -1246,6 +1248,37 @@ static void print_size(uint64_t bytes) {
     printf("%.2f GiB", (double)bytes / gib);
 }
 
+static uint64_t model_metal_max_tensor_bytes(const ds4_model *m,
+                                             uint64_t min_tensor_bytes) {
+    uint64_t max_tensor_bytes = m->max_tensor_bytes;
+    if (min_tensor_bytes > max_tensor_bytes) max_tensor_bytes = min_tensor_bytes;
+    return max_tensor_bytes;
+}
+
+#ifndef DS4_NO_GPU
+static int accelerator_set_model_map_range(ds4_backend backend,
+                                           const ds4_model *m,
+                                           uint64_t metal_min_tensor_bytes) {
+#ifdef __APPLE__
+    if (backend == DS4_BACKEND_METAL) {
+        return ds4_gpu_set_model_map_range_with_max_tensor(
+            m->map,
+            m->size,
+            m->tensor_data_pos,
+            m->size - m->tensor_data_pos,
+            model_metal_max_tensor_bytes(m, metal_min_tensor_bytes));
+    }
+#else
+    (void)backend;
+    (void)metal_min_tensor_bytes;
+#endif
+    return ds4_gpu_set_model_map_range(m->map,
+                                       m->size,
+                                       m->tensor_data_pos,
+                                       m->size - m->tensor_data_pos);
+}
+#endif
+
 static void model_summary(const ds4_model *m) {
     ds4_str name = {0};
     ds4_str arch = {0};
@@ -1309,6 +1342,9 @@ static void model_summary(const ds4_model *m) {
     printf("\n");
     printf("tensor bytes described by GGUF: ");
     print_size(tensor_bytes);
+    printf("\n");
+    printf("largest tensor: ");
+    print_size(m->max_tensor_bytes);
     printf("\n");
     printf("logical parameters: %.2f B\n", (double)params / 1000000000.0);
 
@@ -16493,10 +16529,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         ds4_gpu_set_quality(e->quality);
         (void)ds4_gpu_set_model_fd(e->model.fd);
-        if (!ds4_gpu_set_model_map_range(e->model.map,
-                                           e->model.size,
-                                           e->model.tensor_data_pos,
-                                           e->model.size - e->model.tensor_data_pos))
+        if (!accelerator_set_model_map_range(e->backend,
+                                             &e->model,
+                                             opt->metal_model_max_tensor_bytes))
         {
             fprintf(stderr,
                     "ds4: %s failed to map model views; aborting startup. "
@@ -16507,10 +16542,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             return 1;
         }
         if (e->mtp_ready &&
-            !ds4_gpu_set_model_map_range(e->mtp_model.map,
-                                           e->mtp_model.size,
-                                           e->mtp_model.tensor_data_pos,
-                                           e->mtp_model.size - e->mtp_model.tensor_data_pos))
+            !accelerator_set_model_map_range(e->backend,
+                                             &e->mtp_model,
+                                             opt->metal_model_max_tensor_bytes))
         {
             fprintf(stderr,
                     "ds4: %s failed to map MTP model views; aborting startup. "

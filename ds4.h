@@ -65,6 +65,7 @@ typedef struct {
     const char *directional_steering_file;
     float directional_steering_attn;
     float directional_steering_ffn;
+    uint64_t metal_model_max_tensor_bytes;
     bool warm_weights;
     bool quality;
 } ds4_engine_options;
