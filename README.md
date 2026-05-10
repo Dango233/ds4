@@ -100,7 +100,9 @@ These are single-run Metal CLI numbers with `--ctx 32768`, `--nothink`, greedy
 decoding, and `-n 256`, except where noted. The short prompt is a normal small
 Italian story prompt. The long prompts exercise chunked prefill plus
 long-context decode. Q4 requires the larger-memory machine class, so M3 Max Q4
-numbers are `N/A`.
+numbers are `N/A`. The M2 Ultra rows are five-run averages measured with
+`-sys "" --temp 0`; the 3844-token prompt is
+`tests/test-vectors/prompts/long_code_audit.txt`.
 
 | Machine | Quant | Prompt | Prefill | Generation |
 | --- | ---: | ---: | ---: | ---: |
