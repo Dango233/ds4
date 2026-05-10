@@ -2365,8 +2365,23 @@ static bool parse_prompt(const char **p, char **out) {
     return true;
 }
 
+static char *render_completion_prompt_text(const char *prompt, ds4_think_mode think_mode,
+                                           bool raw_completion) {
+    if (raw_completion) return xstrdup(prompt ? prompt : "");
+
+    buf rendered = {0};
+    buf_puts(&rendered, "<｜begin▁of▁sentence｜>");
+    if (think_mode == DS4_THINK_MAX) buf_puts(&rendered, ds4_think_max_prefix());
+    buf_puts(&rendered, "You are a helpful assistant<｜User｜>");
+    buf_puts(&rendered, prompt ? prompt : "");
+    buf_puts(&rendered, "<｜Assistant｜>");
+    buf_puts(&rendered, ds4_think_mode_enabled(think_mode) ? "<think>" : "</think>");
+    return buf_take(&rendered);
+}
+
 static bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
-                                     int ctx_size, request *r, char *err, size_t errlen) {
+                                     int ctx_size, bool raw_completions, request *r,
+                                     char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
     const char *p = body;
     char *prompt = NULL;
@@ -2484,18 +2499,18 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
         request_free(r);
         return false;
     }
+    if (raw_completions) {
+        r->think_mode = DS4_THINK_NONE;
+        r->prompt_text = render_completion_prompt_text(prompt, r->think_mode, true);
+        ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+        free(prompt);
+        return true;
+    }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
-    buf rendered = {0};
-    buf_puts(&rendered, "<｜begin▁of▁sentence｜>");
-    if (r->think_mode == DS4_THINK_MAX) buf_puts(&rendered, ds4_think_max_prefix());
-    buf_puts(&rendered, "You are a helpful assistant<｜User｜>");
-    buf_puts(&rendered, prompt);
-    buf_puts(&rendered, "<｜Assistant｜>");
-    buf_puts(&rendered, ds4_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
-    r->prompt_text = buf_take(&rendered);
+    r->prompt_text = render_completion_prompt_text(prompt, r->think_mode, false);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     free(prompt);
     return true;
@@ -4167,6 +4182,7 @@ struct server {
     kv_disk_cache kv;
     tool_memory tool_mem;
     bool disable_exact_dsml_tool_replay;
+    bool raw_completions;
     pthread_mutex_t tool_mu;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -6835,7 +6851,8 @@ static void *client_main(void *arg) {
                                 ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/completions")) {
         ok = parse_completion_request(s->engine, hr.body, s->default_tokens,
-                                      ctx_size, &req, err, sizeof(err));
+                                      ctx_size, s->raw_completions,
+                                      &req, err, sizeof(err));
     } else {
         http_error(fd, 404, "unknown endpoint");
         http_request_free(&hr);
@@ -6932,6 +6949,7 @@ typedef struct {
     kv_cache_options kv_cache;
     bool kv_cache_reject_different_quant;
     bool disable_exact_dsml_tool_replay;
+    bool raw_completions;
     int tool_memory_max_ids;
 } server_config;
 
@@ -7033,6 +7051,8 @@ static void usage(FILE *fp) {
         "      Bind port. Default: 8000\n"
         "  --trace FILE\n"
         "      Write a human-readable session trace: prompts, cache decisions, output, tool calls.\n"
+        "  --raw-completions\n"
+        "      Do not wrap /v1/completions prompts in the DS4 chat template.\n"
         "\n"
         "Thinking and sampling:\n"
         "  DeepSeek-compatible chat requests default to thinking mode with high effort.\n"
@@ -7123,6 +7143,8 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--raw-completions")) {
+            c.raw_completions = true;
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
@@ -7196,6 +7218,7 @@ int main(int argc, char **argv) {
     s.session = session;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
+    s.raw_completions = cfg.raw_completions;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
@@ -8080,6 +8103,26 @@ static void test_anthropic_thinking_and_tool_args_preserve_call_order(void) {
     request_free(&r);
 }
 
+static void test_completion_prompt_wraps_by_default(void) {
+    char *prompt = render_completion_prompt_text("Return JSON", DS4_THINK_HIGH, false);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "<｜begin▁of▁sentence｜>You are a helpful assistant<｜User｜>Return JSON<｜Assistant｜><think>") != NULL);
+
+    free(prompt);
+}
+
+static void test_completion_prompt_can_be_raw(void) {
+    const char *raw =
+        "<｜begin▁of▁sentence｜>System text<｜User｜>hello<｜Assistant｜>"
+        "<think>\npartial reasoning";
+    char *prompt = render_completion_prompt_text(raw, DS4_THINK_HIGH, true);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(!strcmp(prompt, raw));
+    TEST_ASSERT(strstr(prompt, "You are a helpful assistant") == NULL);
+
+    free(prompt);
+}
+
 static void test_parse_short_dsml_and_canonical_suffix(void) {
     const char *generated =
         "<think>need a tool</think>"
@@ -8871,6 +8914,8 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_tool_stream_sends_partial_raw_arguments();
+    test_completion_prompt_wraps_by_default();
+    test_completion_prompt_can_be_raw();
     test_openai_tool_stream_holds_partial_dsml_entities();
     test_openai_tool_stream_holds_partial_utf8_arguments();
     test_openai_tool_stream_handles_multiple_calls();

@@ -169,6 +169,21 @@ controls. Tool uses are returned as Anthropic `tool_use` blocks.
 Both APIs support SSE streaming. In thinking mode, reasoning is streamed in the
 native API shape instead of being mixed into final text.
 
+By default, `/v1/completions` wraps the `prompt` as a DS4 user message for
+compatibility with simple OpenAI completions clients. Start the server with
+`--raw-completions` to align with llama.cpp-style raw completions, where the
+client-provided `prompt` is treated as an already-rendered model prompt and the
+server only continues it:
+
+```sh
+./ds4-server --ctx 32768 --raw-completions
+```
+
+This mode is useful for clients that own their prompt templates, such as
+SillyTavern text-completion/instruct presets, KoboldAI/KoboldCpp-style
+frontends, and custom completion clients that send model-specific templates
+directly.
+
 Minimal OpenAI example:
 
 ```sh
