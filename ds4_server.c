@@ -500,6 +500,7 @@ static void random_tool_id(char *dst, size_t dstlen, api_style api) {
 }
 
 typedef struct server server;
+static bool server_prefill_assistant_enabled(const server *s);
 
 typedef struct {
     char *id;
@@ -1883,13 +1884,50 @@ static bool role_is_user_like(const char *role) {
     return !strcmp(role, "user") || !strcmp(role, "tool") || !strcmp(role, "function");
 }
 
-static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
-                                     const tool_schema_orders *tool_orders,
-                                     ds4_think_mode think_mode) {
+static int last_non_system_msg_idx(const chat_msgs *msgs) {
+    if (!msgs) return -1;
+    for (int i = msgs->len - 1; i >= 0; i--) {
+        if (!role_is_system(msgs->v[i].role)) return i;
+    }
+    return -1;
+}
+
+static bool trailing_assistant_prefill_idx(const chat_msgs *msgs, bool prefill_assistant, int *idx_out) {
+    int idx = last_non_system_msg_idx(msgs);
+    if (idx_out) *idx_out = -1;
+    if (!prefill_assistant || idx < 0 || strcmp(msgs->v[idx].role, "assistant")) return false;
+    if (idx_out) *idx_out = idx;
+    return true;
+}
+
+static bool has_consecutive_trailing_assistants(const chat_msgs *msgs) {
+    int idx = last_non_system_msg_idx(msgs);
+    if (idx <= 0 || strcmp(msgs->v[idx].role, "assistant")) return false;
+    for (int i = idx - 1; i >= 0; i--) {
+        if (role_is_system(msgs->v[i].role)) continue;
+        return !strcmp(msgs->v[i].role, "assistant");
+    }
+    return false;
+}
+
+static void append_assistant_prefill_content(buf *out, const char *content) {
+    if (!content) content = "";
+    if (strncmp(content, "<think>", 7) && strncmp(content, "</think>", 8)) {
+        buf_puts(out, "</think>");
+    }
+    buf_puts(out, content);
+}
+
+static char *render_chat_prompt_text_ex(const chat_msgs *msgs, const char *tool_schemas,
+                                        const tool_schema_orders *tool_orders,
+                                        ds4_think_mode think_mode,
+                                        bool prefill_assistant) {
     (void)tool_orders;
     const bool think = ds4_think_mode_enabled(think_mode);
     bool tool_context = tool_schemas && tool_schemas[0];
     int last_user_idx = -1;
+    int prefill_idx = -1;
+    trailing_assistant_prefill_idx(msgs, prefill_assistant, &prefill_idx);
     buf system = {0};
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
@@ -1936,6 +1974,14 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
             pending_assistant = true;
             pending_tool_result = true;
         } else if (!strcmp(m->role, "assistant")) {
+            if (i == prefill_idx) {
+                buf_puts(&out, "<｜Assistant｜>");
+                append_assistant_prefill_content(&out, m->content);
+                append_dsml_tool_calls_text(&out, &m->calls);
+                pending_assistant = false;
+                pending_tool_result = false;
+                continue;
+            }
             if (pending_assistant) {
                 buf_puts(&out, "<｜Assistant｜>");
                 if (think) {
@@ -1966,6 +2012,14 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
     buf_free(&system);
     return buf_take(&out);
 }
+
+#ifdef DS4_SERVER_TEST
+static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
+                                     const tool_schema_orders *tool_orders,
+                                     ds4_think_mode think_mode) {
+    return render_chat_prompt_text_ex(msgs, tool_schemas, tool_orders, think_mode, true);
+}
+#endif
 
 /* The API parsers are intentionally selective JSON parsers: they keep only
  * fields that affect model semantics, rendering, streaming, or cache keys, and
@@ -2122,10 +2176,19 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    bool prefill_assistant = server_prefill_assistant_enabled(s);
+    if (prefill_assistant && has_consecutive_trailing_assistants(&msgs)) {
+        snprintf(err, errlen, "cannot prefill consecutive trailing assistant messages");
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
-    r->prompt_text = render_chat_prompt_text(&msgs, r->has_tools ? tool_schemas : NULL,
-                                             &r->tool_orders, r->think_mode);
+    r->prompt_text = render_chat_prompt_text_ex(&msgs, r->has_tools ? tool_schemas : NULL,
+                                                &r->tool_orders, r->think_mode,
+                                                prefill_assistant);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(tool_schemas);
@@ -2317,10 +2380,20 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    bool prefill_assistant = server_prefill_assistant_enabled(s);
+    if (prefill_assistant && has_consecutive_trailing_assistants(&msgs)) {
+        snprintf(err, errlen, "cannot prefill consecutive trailing assistant messages");
+        chat_msgs_free(&msgs);
+        free(system);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
-    r->prompt_text = render_chat_prompt_text(&msgs, r->has_tools ? tool_schemas : NULL,
-                                             &r->tool_orders, r->think_mode);
+    r->prompt_text = render_chat_prompt_text_ex(&msgs, r->has_tools ? tool_schemas : NULL,
+                                                &r->tool_orders, r->think_mode,
+                                                prefill_assistant);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(system);
@@ -2365,7 +2438,48 @@ static bool parse_prompt(const char **p, char **out) {
     return true;
 }
 
-static bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
+static bool parse_chatml_prompt_text(const char *prompt, chat_msgs *out) {
+    const char *start = "<|im_start|>";
+    const char *end = "<|im_end|>";
+    const size_t start_len = strlen(start);
+    const size_t end_len = strlen(end);
+    const char *p = prompt;
+
+    if (!p || strncmp(p, start, start_len)) return false;
+    while (*p) {
+        if (strncmp(p, start, start_len)) return false;
+        p += start_len;
+
+        const char *nl = strchr(p, '\n');
+        if (!nl) return false;
+        size_t role_len = (size_t)(nl - p);
+        if (role_len && p[role_len - 1] == '\r') role_len--;
+        if (!role_len) return false;
+
+        chat_msg msg = {0};
+        msg.role = xstrndup(p, role_len);
+        p = nl + 1;
+
+        const char *endp = strstr(p, end);
+        const char *nextp = strstr(p, start);
+        if (endp && (!nextp || endp < nextp)) {
+            msg.content = xstrndup(p, (size_t)(endp - p));
+            p = endp + end_len;
+            if (p[0] == '\r' && p[1] == '\n') p += 2;
+            else if (*p == '\n') p++;
+        } else if (!endp && !nextp) {
+            msg.content = xstrdup(p);
+            p += strlen(p);
+        } else {
+            chat_msg_free(&msg);
+            return false;
+        }
+        chat_msgs_push(out, msg);
+    }
+    return out->len > 0;
+}
+
+static bool parse_completion_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                      int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
     const char *p = body;
@@ -2488,6 +2602,24 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    chat_msgs msgs = {0};
+    if (parse_chatml_prompt_text(prompt, &msgs)) {
+        bool prefill_assistant = server_prefill_assistant_enabled(s);
+        if (prefill_assistant && has_consecutive_trailing_assistants(&msgs)) {
+            snprintf(err, errlen, "cannot prefill consecutive trailing assistant messages");
+            chat_msgs_free(&msgs);
+            free(prompt);
+            request_free(r);
+            return false;
+        }
+        r->prompt_text = render_chat_prompt_text_ex(&msgs, NULL, NULL, r->think_mode,
+                                                    prefill_assistant);
+        ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+        chat_msgs_free(&msgs);
+        free(prompt);
+        return true;
+    }
+    chat_msgs_free(&msgs);
     buf rendered = {0};
     buf_puts(&rendered, "<｜begin▁of▁sentence｜>");
     if (r->think_mode == DS4_THINK_MAX) buf_puts(&rendered, ds4_think_max_prefix());
@@ -4167,6 +4299,7 @@ struct server {
     kv_disk_cache kv;
     tool_memory tool_mem;
     bool disable_exact_dsml_tool_replay;
+    bool prefill_assistant;
     pthread_mutex_t tool_mu;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -4180,6 +4313,10 @@ struct server {
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
 };
+
+static bool server_prefill_assistant_enabled(const server *s) {
+    return !s || s->prefill_assistant;
+}
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
  * after the response has been written, so request data and the socket remain
@@ -6834,7 +6971,7 @@ static void *client_main(void *arg) {
         ok = parse_chat_request(s->engine, s, hr.body, s->default_tokens,
                                 ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/completions")) {
-        ok = parse_completion_request(s->engine, hr.body, s->default_tokens,
+        ok = parse_completion_request(s->engine, s, hr.body, s->default_tokens,
                                       ctx_size, &req, err, sizeof(err));
     } else {
         http_error(fd, 404, "unknown endpoint");
@@ -6932,6 +7069,7 @@ typedef struct {
     kv_cache_options kv_cache;
     bool kv_cache_reject_different_quant;
     bool disable_exact_dsml_tool_replay;
+    bool prefill_assistant;
     int tool_memory_max_ids;
 } server_config;
 
@@ -7033,6 +7171,8 @@ static void usage(FILE *fp) {
         "      Bind port. Default: 8000\n"
         "  --trace FILE\n"
         "      Write a human-readable session trace: prompts, cache decisions, output, tool calls.\n"
+        "  --no-prefill-assistant\n"
+        "      Treat a trailing assistant message as complete history instead of a generation prefix.\n"
         "\n"
         "Thinking and sampling:\n"
         "  DeepSeek-compatible chat requests default to thinking mode with high effort.\n"
@@ -7094,6 +7234,7 @@ static server_config parse_options(int argc, char **argv) {
         .port = 8000,
         .ctx_size = 32768,
         .default_tokens = 393216,
+        .prefill_assistant = true,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
     };
     c.kv_cache = kv_cache_default_options();
@@ -7123,6 +7264,10 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--prefill-assistant")) {
+            c.prefill_assistant = true;
+        } else if (!strcmp(arg, "--no-prefill-assistant")) {
+            c.prefill_assistant = false;
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
@@ -7196,6 +7341,7 @@ int main(int argc, char **argv) {
     s.session = session;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
+    s.prefill_assistant = cfg.prefill_assistant;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
@@ -7964,6 +8110,86 @@ static void test_render_non_thinking_prompt_closes_think(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_render_trailing_assistant_prefill(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Return JSON");
+    chat_msgs_push(&msgs, user);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.content = xstrdup("{\"answer\":");
+    chat_msgs_push(&msgs, assistant);
+
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "<｜User｜>Return JSON<｜Assistant｜></think>{\"answer\":") != NULL);
+    TEST_ASSERT(strstr(prompt, "{\"answer\":<｜end▁of▁sentence｜>") == NULL);
+    TEST_ASSERT(strstr(prompt, "<｜Assistant｜></think>{\"answer\":<｜Assistant｜>") == NULL);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_render_trailing_assistant_prefill_is_content_by_default(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Return JSON");
+    chat_msgs_push(&msgs, user);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.content = xstrdup("{\"answer\":");
+    chat_msgs_push(&msgs, assistant);
+
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "<｜Assistant｜></think>{\"answer\":") != NULL);
+    TEST_ASSERT(strstr(prompt, "<｜Assistant｜><think>{\"answer\":") == NULL);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_completion_chatml_trailing_assistant_prefill(void) {
+    const char *chatml =
+        "<|im_start|>system\nYou are terse.<|im_end|>\n"
+        "<|im_start|>user\nReturn JSON<|im_end|>\n"
+        "<|im_start|>assistant\n{\"answer\":";
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_chatml_prompt_text(chatml, &msgs));
+    TEST_ASSERT(msgs.len == 3);
+    TEST_ASSERT(!strcmp(msgs.v[2].role, "assistant"));
+    TEST_ASSERT(!strcmp(msgs.v[2].content, "{\"answer\":"));
+
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "You are terse.<｜User｜>Return JSON<｜Assistant｜></think>{\"answer\":") != NULL);
+    TEST_ASSERT(strstr(prompt, "{\"answer\":<｜end▁of▁sentence｜>") == NULL);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_render_trailing_assistant_prefill_can_be_disabled(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Return JSON");
+    chat_msgs_push(&msgs, user);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.content = xstrdup("{\"answer\":");
+    chat_msgs_push(&msgs, assistant);
+
+    char *prompt = render_chat_prompt_text_ex(&msgs, NULL, NULL, DS4_THINK_NONE, false);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "<｜Assistant｜></think>{\"answer\":<｜end▁of▁sentence｜>") != NULL);
+
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
 static void test_render_drops_old_reasoning_without_tools(void) {
     chat_msgs msgs = {0};
     chat_msg user1 = {0};
@@ -8172,8 +8398,9 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     assistant.calls = calls;
     memset(&calls, 0, sizeof(calls));
     chat_msgs_push(&history_msgs, assistant);
-    char *future_prompt = render_chat_prompt_text(&history_msgs, tool_schemas,
-                                                  &r.tool_orders, DS4_THINK_HIGH);
+    char *future_prompt = render_chat_prompt_text_ex(&history_msgs, tool_schemas,
+                                                     &r.tool_orders, DS4_THINK_HIGH,
+                                                     false);
 
     TEST_ASSERT(!strcmp(canonical.ptr, future_prompt));
 
@@ -8246,8 +8473,9 @@ static void test_tool_checkpoint_minifies_json_parameters(void) {
     assistant.calls = calls;
     memset(&calls, 0, sizeof(calls));
     chat_msgs_push(&history_msgs, assistant);
-    char *future_prompt = render_chat_prompt_text(&history_msgs, tool_schemas,
-                                                  &r.tool_orders, DS4_THINK_HIGH);
+    char *future_prompt = render_chat_prompt_text_ex(&history_msgs, tool_schemas,
+                                                     &r.tool_orders, DS4_THINK_HIGH,
+                                                     false);
 
     TEST_ASSERT(!strcmp(canonical.ptr, future_prompt));
 
@@ -8858,6 +9086,10 @@ static void ds4_server_unit_tests_run(void) {
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
+    test_render_trailing_assistant_prefill();
+    test_render_trailing_assistant_prefill_is_content_by_default();
+    test_completion_chatml_trailing_assistant_prefill();
+    test_render_trailing_assistant_prefill_can_be_disabled();
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();
     test_tool_schema_order_from_anthropic_schema();

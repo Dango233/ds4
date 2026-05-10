@@ -169,6 +169,13 @@ controls. Tool uses are returned as Anthropic `tool_use` blocks.
 Both APIs support SSE streaming. In thinking mode, reasoning is streamed in the
 native API shape instead of being mixed into final text.
 
+If the final non-system message is an assistant message, the server treats its
+content as the beginning of the next response and continues generation from
+there. Start the server with `--no-prefill-assistant` to treat trailing
+assistant messages as completed history instead. The completions endpoint also
+recognizes ChatML prompts with a trailing `<|im_start|>assistant` block and
+applies the same prefill behavior.
+
 Minimal OpenAI example:
 
 ```sh
