@@ -99,6 +99,8 @@ static void usage(FILE *fp) {
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before generation. Slower startup, fewer first-use stalls.\n"
+        "  --metal-model-max-tensor-mb N\n"
+        "      Minimum tensor size used for Metal model-view overlap. Default: inferred from GGUF.\n"
         "\n"
         "Prompt and generation:\n"
         "  -p, --prompt TEXT\n"
@@ -188,6 +190,15 @@ static uint64_t parse_u64(const char *s, const char *opt) {
         exit(2);
     }
     return (uint64_t)v;
+}
+
+static uint64_t parse_mib_bytes(const char *s, const char *opt) {
+    uint64_t mib = parse_u64(s, opt);
+    if (mib > UINT64_MAX / (1024ull * 1024ull)) {
+        fprintf(stderr, "ds4: invalid value for %s: %s\n", opt, s);
+        exit(2);
+    }
+    return mib * 1024ull * 1024ull;
 }
 
 static float parse_float_range(const char *s, const char *opt, float min, float max) {
@@ -1251,6 +1262,9 @@ static cli_config parse_options(int argc, char **argv) {
             c.inspect = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
+        } else if (!strcmp(arg, "--metal-model-max-tensor-mb")) {
+            c.engine.metal_model_max_tensor_bytes =
+                parse_mib_bytes(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--server")) {
             fprintf(stderr, "ds4: use ds4-server for the HTTP server\n");
             exit(2);

@@ -61,6 +61,7 @@ typedef struct {
     int n_threads;
     int mtp_draft_tokens;
     float mtp_margin;
+    uint64_t metal_model_max_tensor_bytes;
     bool warm_weights;
     bool quality;
 } ds4_engine_options;
