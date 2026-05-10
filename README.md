@@ -97,9 +97,10 @@ select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 ## Speed
 
 These are single-run Metal CLI numbers with `--ctx 32768`, `--nothink`, greedy
-decoding, and `-n 256`. The short prompt is a normal small Italian story
-prompt. The long prompts exercise chunked prefill plus long-context decode.
-Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
+decoding, and `-n 256`, except where noted. The short prompt is a normal small
+Italian story prompt. The long prompts exercise chunked prefill plus
+long-context decode. Q4 requires the larger-memory machine class, so M3 Max Q4
+numbers are `N/A`.
 
 | Machine | Quant | Prompt | Prefill | Generation |
 | --- | ---: | ---: | ---: | ---: |
@@ -112,6 +113,8 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | 12018 tokens | 448.82 t/s | 26.62 t/s |
 | DGX Spark GB10, 128 GB | q2 | 7047 tokens | 343.81 t/s | 13.75 t/s |
+| Mac Studio M2 Ultra, 192 GB | q2 | short, 5-run avg | 51.86 t/s | 30.72 t/s |
+| Mac Studio M2 Ultra, 192 GB | q2 | 3844 tokens, 5-run avg | 401.58 t/s | 22.56 t/s |
 
 ## CLI
 
