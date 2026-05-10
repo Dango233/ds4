@@ -7093,6 +7093,11 @@ static int parse_nonneg_int_arg(const char *s, const char *opt) {
     return (int)v;
 }
 
+static uint64_t parse_mib_bytes_arg(const char *s, const char *opt) {
+    uint64_t mib = (uint64_t)parse_int_arg(s, opt);
+    return mib * 1024ull * 1024ull;
+}
+
 static float parse_float_arg(const char *s, const char *opt, float minv, float maxv) {
     char *end = NULL;
     float v = strtof(s, &end);
@@ -7163,6 +7168,8 @@ static void usage(FILE *fp) {
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
+        "  --metal-model-max-tensor-mb N\n"
+        "      Minimum tensor size used for Metal model-view overlap. Default: inferred from GGUF.\n"
         "\n"
         "HTTP API:\n"
         "  --host HOST\n"
@@ -7292,6 +7299,9 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
+        } else if (!strcmp(arg, "--metal-model-max-tensor-mb")) {
+            c.engine.metal_model_max_tensor_bytes =
+                parse_mib_bytes_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cpu") || !strcmp(arg, "--backend")) {
             server_log(DS4_LOG_DEFAULT, "ds4-server: server mode is Metal-only");
             exit(2);
