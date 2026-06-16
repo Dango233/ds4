@@ -2,6 +2,19 @@
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
 
+> [!NOTE]
+> This branch is a **pre-merge convenience fork** tracking upstream
+> `antirez/ds4` plus the pending raw completions PR:
+>
+> - llama.cpp-style raw `/v1/completions` mode for client-rendered prompt
+>   templates: antirez/ds4#61
+>
+> The older local benchmark/q4 experiment branches are not carried on this
+> `main` branch now; they were closed or need fresh minimal PRs against current
+> upstream. This fork is not a replacement for upstream `antirez/ds4`, just a
+> temporary testing branch. Thanks to antirez for creating and maintaining
+> DwarfStar.
+
 **DwarfStar** is a small native inference engine optimized first for
 **DeepSeek V4 Flash**. It also supports **GLM 5.2** and, on very high-memory
 machines, **DeepSeek V4 PRO**. It is self-contained and deliberately narrow,
