@@ -615,6 +615,10 @@ typedef struct {
     stop_list stops;
     char *raw_body;
     char *prompt_text;
+    /* The client owns both prompt and continuation protocol in raw completion
+     * mode. In particular, <think> and </think> are output text/control chosen
+     * by that prompt, not server-side no-thinking stop markers. */
+    bool raw_completion;
     tool_schema_orders tool_orders;
     int max_tokens;
     int top_k;
@@ -809,6 +813,16 @@ static void request_free(request *r) {
 static ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effort) {
     if (!enabled || effort == DS4_THINK_NONE) return DS4_THINK_NONE;
     return effort == DS4_THINK_MAX ? DS4_THINK_MAX : DS4_THINK_HIGH;
+}
+
+static bool request_thinking_controls_are_stops(const request *r) {
+    return r && !r->raw_completion && !ds4_think_mode_enabled(r->think_mode);
+}
+
+static bool request_token_is_stop(ds4_engine *e, const request *r, int token) {
+    if (ds4_token_is_stop(e, token)) return true;
+    return request_thinking_controls_are_stops(r) &&
+           ds4_token_is_thinking_control(e, token);
 }
 
 static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
@@ -4453,6 +4467,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
         return false;
     }
     if (raw_completions) {
+        r->raw_completion = true;
         r->think_mode = DS4_THINK_NONE;
         r->prompt_text = render_completion_prompt_text(prompt, r->think_mode, true);
         ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
@@ -11420,9 +11435,7 @@ decode_again:
         }
         int token = ds4_session_sample(slot->session, temperature, top_k,
                                        top_p, min_p, &rng);
-        if (ds4_token_is_stop_for_think_mode(s->engine,
-                                             token,
-                                             j->req.think_mode)) {
+        if (request_token_is_stop(s->engine, &j->req, token)) {
             finish = "stop";
             break;
         }
@@ -11457,9 +11470,7 @@ decode_again:
         bool stop_decode = false;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
             token = toks[ti];
-            if (ds4_token_is_stop_for_think_mode(s->engine,
-                                                 token,
-                                                 j->req.think_mode)) {
+            if (request_token_is_stop(s->engine, &j->req, token)) {
                 finish = "stop";
                 stop_decode = true;
                 break;
@@ -14792,6 +14803,23 @@ static void test_completion_prompt_can_be_raw(void) {
     free(prompt);
 }
 
+static void test_raw_completion_does_not_stop_on_thinking_controls(void) {
+    request r;
+    request_init(&r, REQ_COMPLETION, 32);
+
+    r.think_mode = DS4_THINK_NONE;
+    TEST_ASSERT(request_thinking_controls_are_stops(&r));
+
+    r.raw_completion = true;
+    TEST_ASSERT(!request_thinking_controls_are_stops(&r));
+
+    r.raw_completion = false;
+    r.think_mode = DS4_THINK_HIGH;
+    TEST_ASSERT(!request_thinking_controls_are_stops(&r));
+
+    request_free(&r);
+}
+
 static void test_parse_short_dsml_and_canonical_suffix(void) {
     const char *generated =
         "<think>need a tool</think>"
@@ -17509,6 +17537,7 @@ static void ds4_server_unit_tests_run(void) {
     test_streaming_holds_partial_utf8();
     test_completion_prompt_wraps_by_default();
     test_completion_prompt_can_be_raw();
+    test_raw_completion_does_not_stop_on_thinking_controls();
     test_parse_short_dsml_and_canonical_suffix();
     test_parse_glm_tool_call_message();
     test_dsml_parser_recovers_loose_nested_parameters();
