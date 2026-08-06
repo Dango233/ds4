@@ -16504,7 +16504,7 @@ static void test_request_parsers_reject_malformed_duplicate_owned_fields(void) {
 
     ok = parse_completion_request(NULL,
         "{\"prompt\":\"hello\",\"prompt\":\"bad\\q\",\"max_tokens\":1}",
-        1, 100, &r, err, sizeof(err));
+        1, 100, false, &r, err, sizeof(err));
     TEST_ASSERT(!ok);
     if (ok) request_free(&r);
 }
