@@ -351,7 +351,8 @@ static void print_server_thinking(FILE *fp, const help_colors *c) {
 }
 
 static void print_kv_cache(FILE *fp, const help_colors *c) {
-    title(fp, c, "Disk KV Cache");
+    title(fp, c, "KV Cache");
+    opt(fp, c, "--kv-memory-space-mb N", "Opt in to immutable Flash prefix checkpoints with this RAM budget. 0 disables. Default: 0");
     opt(fp, c, "--kv-disk-dir DIR", "Enable disk KV checkpoints in DIR.");
     opt(fp, c, "--kv-disk-space-mb N", "Disk budget. Default when enabled: 4096");
     opt(fp, c, "--kv-cache-min-tokens N", "Do not save/load checkpoints shorter than N. Default: 512");

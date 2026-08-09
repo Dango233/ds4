@@ -3,6 +3,7 @@
 
 #include "ds4.h"
 
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -77,7 +78,24 @@ typedef struct {
     const char *log_name;
     void *log_ud;
     void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg);
+    struct ds4_prefix_cache *prefix;
 } ds4_kvstore;
+
+typedef struct {
+    int tokens;
+    size_t text_bytes;
+    bool ram_resident;
+    uint64_t restore_bytes;
+} ds4_prefix_lookup;
+
+typedef struct {
+    uint64_t nodes;
+    uint64_t ram_nodes;
+    uint64_t durable_nodes;
+    uint64_t pending_nodes;
+    uint64_t ram_bytes;
+    uint64_t disk_bytes;
+} ds4_prefix_stats;
 
 typedef struct {
     const char *text;
@@ -195,6 +213,25 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               const ds4_kvstore_trailer_hooks *hooks,
                               bool responses_protocol);
 void ds4_kvstore_load_result_free(ds4_kvstore_load_result *result);
+
+bool ds4_kvstore_prefix_enable(ds4_kvstore *kc, ds4_engine *engine,
+                               uint64_t memory_mb,
+                               pthread_mutex_t *inference_mu);
+bool ds4_kvstore_prefix_enabled(const ds4_kvstore *kc);
+bool ds4_kvstore_prefix_capture(ds4_kvstore *kc, ds4_engine *engine,
+                                ds4_session *session, const char *cache_text,
+                                char *err, size_t errlen);
+bool ds4_kvstore_prefix_find(ds4_kvstore *kc, const char *prompt_text,
+                             const ds4_tokens *prompt_tokens,
+                             ds4_prefix_lookup *out);
+int ds4_kvstore_prefix_restore(ds4_kvstore *kc, ds4_engine *engine,
+                               ds4_session *session, const char *prompt_text,
+                               const ds4_tokens *prompt_tokens,
+                               ds4_tokens *effective_prompt,
+                               ds4_prefix_lookup *out,
+                               char *err, size_t errlen);
+void ds4_kvstore_prefix_wait_idle(ds4_kvstore *kc);
+void ds4_kvstore_prefix_stats(ds4_kvstore *kc, ds4_prefix_stats *out);
 
 bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
                              uint32_t *text_bytes);

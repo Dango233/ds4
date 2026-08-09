@@ -9406,6 +9406,36 @@ static void kv_cache_close(kv_disk_cache *kc) {
     ds4_kvstore_close(kc);
 }
 
+static bool prefix_cache_request_eligible(const request *r) {
+    if (!r || r->api != API_OPENAI || r->has_tools ||
+        r->prompt_preserves_reasoning || !r->prompt_text)
+        return false;
+    return r->raw_completion || !ds4_think_mode_enabled(r->think_mode);
+}
+
+/* The progress hook is invoked while the model session is stable and the
+ * inference mutex is already owned by server_session_sync(). */
+static bool prefix_cache_capture_locked(server *s, server_slot *slot) {
+    if (!s || !slot || !ds4_kvstore_prefix_enabled(&s->kv)) return false;
+    char err[160] = {0};
+    bool ok = ds4_kvstore_prefix_capture(&s->kv, s->engine, slot->session,
+                                         NULL, err, sizeof(err));
+    if (!ok && err[0]) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: prefix capture skipped at %d tokens: %s",
+                   ds4_session_pos(slot->session), err);
+    }
+    return ok;
+}
+
+static bool prefix_cache_capture(server *s, server_slot *slot) {
+    if (!s || !slot || !ds4_kvstore_prefix_enabled(&s->kv)) return false;
+    pthread_mutex_lock(&s->inference_mu);
+    bool ok = prefix_cache_capture_locked(s, slot);
+    pthread_mutex_unlock(&s->inference_mu);
+    return ok;
+}
+
 static char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens, size_t *out_len) {
     return ds4_kvstore_render_tokens_text(engine, tokens, out_len);
 }
@@ -9686,6 +9716,87 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                                   loaded_path_out,
                                   loaded_ext_flags_out,
                                   req && req->api == API_RESPONSES);
+}
+
+typedef struct {
+    bool found;
+    int tokens;
+    size_t text_bytes;
+    uint64_t file_bytes;
+} kvc_candidate;
+
+static kvc_candidate kv_cache_find_candidate(server *s, server_slot *slot,
+                                             const request *req) {
+    kvc_candidate c = {0};
+    if (!s || !slot || !req || !s->kv.enabled || !req->prompt_text) return c;
+    pthread_mutex_lock(&s->kv_mu);
+    const int idx = ds4_kvstore_find_text_prefix(
+        &s->kv, req->prompt_text, ds4_engine_model_id(s->engine),
+        ds4_engine_routed_quant_bits(s->engine),
+        ds4_session_ctx(slot->session));
+    if (idx >= 0) {
+        const ds4_kvstore_entry *e = &s->kv.entry[idx];
+        c.found = true;
+        c.tokens = (int)e->tokens;
+        c.text_bytes = (size_t)e->text_bytes;
+        c.file_bytes = e->file_size;
+    }
+    pthread_mutex_unlock(&s->kv_mu);
+    return c;
+}
+
+static int kv_cache_try_load_best(server *s, server_slot *slot,
+                                  const request *req,
+                                  ds4_tokens *effective_prompt,
+                                  char **loaded_path_out,
+                                  uint8_t *loaded_ext_flags_out,
+                                  const char **source_out) {
+    if (source_out) *source_out = "none";
+    ds4_prefix_lookup tree = {0};
+    const bool tree_found = prefix_cache_request_eligible(req) &&
+        ds4_kvstore_prefix_find(&s->kv, req->prompt_text,
+                                &req->prompt, &tree);
+    const kvc_candidate kvc = kv_cache_find_candidate(s, slot, req);
+
+    bool tree_first = tree_found && !kvc.found;
+    if (tree_found && kvc.found) {
+        tree_first = tree.text_bytes > kvc.text_bytes ||
+            (tree.text_bytes == kvc.text_bytes && tree.tokens > kvc.tokens) ||
+            (tree.text_bytes == kvc.text_bytes && tree.tokens == kvc.tokens &&
+             (tree.ram_resident || tree.restore_bytes <= kvc.file_bytes));
+    }
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        const bool try_tree = attempt == 0 ? tree_first : !tree_first;
+        if (try_tree) {
+            if (!tree_found) continue;
+            ds4_prefix_lookup loaded = {0};
+            char err[160] = {0};
+            int rc = ds4_kvstore_prefix_restore(
+                &s->kv, s->engine, slot->session, req->prompt_text,
+                &req->prompt, effective_prompt, &loaded,
+                err, sizeof(err));
+            if (rc == 0 && err[0]) {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: prefix restore rejected: %s", err);
+            }
+            if (rc > 0) {
+                if (source_out)
+                    *source_out = tree.ram_resident ? "tree-ram" : "tree-disk";
+                return rc;
+            }
+        } else {
+            if (!kvc.found) continue;
+            int rc = kv_cache_try_load(s, slot, req, effective_prompt,
+                                       loaded_path_out,
+                                       loaded_ext_flags_out);
+            if (rc > 0) {
+                if (source_out) *source_out = "disk-text";
+                return rc;
+            }
+        }
+    }
+    return 0;
 }
 
 static int live_text_prefix_prompt(server *s, server_slot *slot,
@@ -10187,6 +10298,7 @@ typedef struct {
     const char *phase;
     bool has_tools;
     bool responses_protocol;
+    bool prefix_capture;
     double t0;
     double last_t;
     int last_current;
@@ -10619,9 +10731,9 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (is_display) return;
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
-        if (p->srv && p->slot && current > p->cached_tokens) {
+        if (p->srv && p->slot && current > p->cached_tokens &&
+            !p->prefix_capture)
             kv_cache_maybe_store_continued(p->srv, p->slot);
-        }
         return;
     }
     int display_start = p->cached_tokens;
@@ -10660,7 +10772,14 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                chunk_tps,
                avg_tps,
                elapsed);
-    if (p->srv && p->slot && current > p->cached_tokens) {
+    bool prefix_captured = false;
+    if (p->srv && p->slot && p->prefix_capture &&
+        current > p->cached_tokens && current < p->prompt_tokens &&
+        ds4_session_pos(p->slot->session) == current) {
+        prefix_captured = prefix_cache_capture_locked(p->srv, p->slot);
+    }
+    if (p->srv && p->slot && current > p->cached_tokens &&
+        (!p->prefix_capture || !prefix_captured)) {
         kv_cache_maybe_store_continued(p->srv, p->slot);
     }
 }
@@ -11264,12 +11383,15 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         kv_cache_store_current(s, slot, "evict");
     }
     if (cached == 0) {
-        disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
-                                        &disk_cache_path,
-                                        &disk_cache_ext_flags);
-        if (disk_cached > 0) {
-            cached = disk_cached;
-            cache_source = "disk-text";
+        const char *loaded_source = "none";
+        int loaded_cached = kv_cache_try_load_best(
+            s, slot, &j->req, &effective_prompt, &disk_cache_path,
+            &disk_cache_ext_flags, &loaded_source);
+        if (loaded_cached > 0) {
+            cached = loaded_cached;
+            cache_source = loaded_source;
+            if (strcmp(loaded_source, "tree-ram"))
+                disk_cached = loaded_cached;
             prompt_for_sync = &effective_prompt;
         }
     }
@@ -11303,6 +11425,8 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         .cached_tokens = cached,
         .has_tools = j->req.has_tools,
         .responses_protocol = responses_protocol,
+        .prefix_capture = prefix_cache_request_eligible(&j->req) &&
+                          ds4_kvstore_prefix_enabled(&s->kv),
         .t0 = t0,
         .fd = j->fd,
         .stream = j->req.stream,
@@ -11358,7 +11482,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
 
     int cold_store_len = 0;
-    if (cached == 0 &&
+    if (!progress.prefix_capture && cached == 0 &&
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens &&
         s->kv.opt.cold_max_tokens > 0 &&
@@ -11434,7 +11558,10 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     if (!thinking_live_continuation) thinking_live_clear(s, slot);
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
-    kv_cache_maybe_store_continued(s, slot);
+    const bool terminal_prefix_captured =
+        progress.prefix_capture && prefix_cache_capture(s, slot);
+    if (!terminal_prefix_captured)
+        kv_cache_maybe_store_continued(s, slot);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -12195,6 +12322,12 @@ decode_again:
                        now_sec() - t0);
         }
     }
+    /* The response is already on the wire, so retaining the real generated
+     * terminal does not add client-visible latency.  This is the checkpoint
+     * the next turn normally extends, not merely the pre-generation prompt. */
+    if (progress.prefix_capture && strcmp(final_finish, "error") &&
+        ds4_session_payload_bytes(slot->session) > 0)
+        (void)prefix_cache_capture(s, slot);
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
@@ -12695,6 +12828,7 @@ typedef struct {
     const char *trace_path;
     const char *kv_disk_dir;
     uint64_t kv_disk_space_mb;
+    uint64_t kv_memory_space_mb;
     kv_cache_options kv_cache;
     bool kv_cache_reject_different_quant;
     bool disable_exact_dsml_tool_replay;
@@ -12921,6 +13055,9 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
             c.kv_disk_space_mb = (uint64_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-memory-space-mb")) {
+            c.kv_memory_space_mb = (uint64_t)parse_nonneg_int_arg(
+                need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-min-tokens")) {
             c.kv_cache.min_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-cold-max-tokens")) {
@@ -13178,6 +13315,15 @@ int main(int argc, char **argv) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
     }
+    if (cfg.kv_memory_space_mb > 0 &&
+        !ds4_kvstore_prefix_enable(&s.kv, engine,
+                                   cfg.kv_memory_space_mb,
+                                   &s.inference_mu)) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: failed to enable immutable prefix tree");
+        server_close_resources(&s);
+        return 1;
+    }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: exact DSML tool replay disabled; tool history uses canonical JSON rendering");
@@ -13367,6 +13513,7 @@ static void test_mixed_prefill_quantum_option(void) {
     char *default_argv[] = {"ds4-server"};
     server_config defaults = parse_options(1, default_argv);
     TEST_ASSERT(defaults.mixed_prefill_quantum == 128);
+    TEST_ASSERT(defaults.kv_memory_space_mb == 0);
 
     char *custom_argv[] = {
         "ds4-server", "--mixed-prefill-quantum", "2048"
@@ -13374,11 +13521,41 @@ static void test_mixed_prefill_quantum_option(void) {
     server_config custom = parse_options(3, custom_argv);
     TEST_ASSERT(custom.mixed_prefill_quantum == 2048);
 
+    char *prefix_argv[] = {
+        "ds4-server", "--kv-memory-space-mb", "4096"
+    };
+    server_config prefix = parse_options(3, prefix_argv);
+    TEST_ASSERT(prefix.kv_memory_space_mb == 4096);
+
     server s = {.mixed_prefill_quantum = custom.mixed_prefill_quantum};
     TEST_ASSERT(server_prefill_quantum_for(&s, false) == 2048);
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
     s.mixed_prefill_quantum = defaults.mixed_prefill_quantum;
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
+}
+
+static void test_prefix_cache_protocol_gate(void) {
+    request r = {
+        .kind = REQ_COMPLETION,
+        .api = API_OPENAI,
+        .prompt_text = "plain text",
+        .think_mode = DS4_THINK_NONE,
+    };
+    TEST_ASSERT(prefix_cache_request_eligible(&r));
+    r.think_mode = DS4_THINK_HIGH;
+    TEST_ASSERT(!prefix_cache_request_eligible(&r));
+    r.raw_completion = true;
+    TEST_ASSERT(prefix_cache_request_eligible(&r));
+    r.has_tools = true;
+    TEST_ASSERT(!prefix_cache_request_eligible(&r));
+    r.has_tools = false;
+    r.api = API_RESPONSES;
+    TEST_ASSERT(!prefix_cache_request_eligible(&r));
+    r.api = API_ANTHROPIC;
+    TEST_ASSERT(!prefix_cache_request_eligible(&r));
+    r.api = API_OPENAI;
+    r.prompt_preserves_reasoning = true;
+    TEST_ASSERT(!prefix_cache_request_eligible(&r));
 }
 
 static void test_batched_live_continuation_slot_binding(void) {
@@ -17858,6 +18035,7 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
+    test_prefix_cache_protocol_gate();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();

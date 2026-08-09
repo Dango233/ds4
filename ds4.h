@@ -191,6 +191,10 @@ typedef struct {
     uint64_t cap;
 } ds4_session_snapshot;
 
+/* Immutable Flash prefix checkpoint.  The engine owns the binary layout and
+ * keeps the history delta and terminal frontier in one atomic object. */
+typedef struct ds4_prefix_node ds4_prefix_node;
+
 typedef struct {
     char *path;
     uint64_t bytes;
@@ -463,6 +467,31 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen);
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen);
 void ds4_session_snapshot_free(ds4_session_snapshot *snap);
+
+/* Flash-only segmented prefix checkpoints.  Capture requires the live session
+ * to be at an exact checkpoint.  Passing parent=NULL creates a root node;
+ * otherwise the parent must be an exact token/counter prefix.  Restore consumes
+ * one complete root-to-leaf chain. */
+int ds4_session_prefix_node_capture(ds4_session *s,
+                                    const ds4_prefix_node *parent,
+                                    ds4_prefix_node **out,
+                                    char *err, size_t errlen);
+int ds4_session_prefix_chain_restore(ds4_session *s,
+                                     const ds4_prefix_node *const *chain,
+                                     size_t count,
+                                     char *err, size_t errlen);
+int ds4_prefix_node_read(ds4_engine *engine, FILE *fp, uint64_t bytes,
+                         ds4_prefix_node **out, char *err, size_t errlen);
+int ds4_prefix_node_write(const ds4_prefix_node *node, FILE *fp,
+                          char *err, size_t errlen);
+void ds4_prefix_node_free(ds4_prefix_node *node);
+uint64_t ds4_prefix_node_bytes(const ds4_prefix_node *node);
+void ds4_prefix_node_digest(const ds4_prefix_node *node, uint64_t out[2]);
+uint64_t ds4_prefix_node_compat_id(const ds4_prefix_node *node);
+uint64_t ds4_prefix_node_token_hash(const ds4_prefix_node *node);
+uint32_t ds4_prefix_node_parent_tokens(const ds4_prefix_node *node);
+uint32_t ds4_prefix_node_total_tokens(const ds4_prefix_node *node);
+uint64_t ds4_engine_prefix_compat_id(ds4_engine *engine);
 
 uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
                                          uint32_t layer_start,

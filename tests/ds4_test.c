@@ -4939,6 +4939,672 @@ static void test_metal_short_prefill_ratio4(void) {
     }
 }
 
+static void test_remove_prefix_cache_dir(const char *path) {
+    if (!path) return;
+    char tree[PATH_MAX];
+    snprintf(tree, sizeof(tree), "%s/tree-v1", path);
+    DIR *dir = opendir(tree);
+    if (dir) {
+        struct dirent *de;
+        while ((de = readdir(dir)) != NULL) {
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+                continue;
+            char file[PATH_MAX];
+            snprintf(file, sizeof(file), "%s/%s", tree, de->d_name);
+            unlink(file);
+        }
+        closedir(dir);
+    }
+    rmdir(tree);
+    rmdir(path);
+}
+
+static bool test_truncate_one_prefix_file(const char *path) {
+    char tree[PATH_MAX];
+    snprintf(tree, sizeof(tree), "%s/tree-v1", path);
+    DIR *dir = opendir(tree);
+    if (!dir) return false;
+    bool truncated = false;
+    struct dirent *de;
+    while (!truncated && (de = readdir(dir)) != NULL) {
+        if (!strstr(de->d_name, ".ptn")) continue;
+        char file[PATH_MAX];
+        snprintf(file, sizeof(file), "%s/%s", tree, de->d_name);
+        struct stat st;
+        if (stat(file, &st) == 0 && st.st_size > 1)
+            truncated = truncate(file, st.st_size - 1) == 0;
+    }
+    closedir(dir);
+    return truncated;
+}
+
+static void test_prefix_node_boundaries(ds4_engine *engine,
+                                        const ds4_tokens *all) {
+    static const int positions[] = {
+        4, 127, 128, 129, 2047, 2048, 2049, 4095, 4096, 4097,
+    };
+    ds4_session *source = NULL;
+    ds4_session *target = NULL;
+    TEST_ASSERT(ds4_session_create(&source, engine, 8192) == 0);
+    TEST_ASSERT(ds4_session_create(&target, engine, 8192) == 0);
+    float *a = malloc(200000u * sizeof(float));
+    float *b = malloc(200000u * sizeof(float));
+    TEST_ASSERT(a != NULL && b != NULL);
+    if (!source || !target || !a || !b) goto done;
+
+    char err[256] = {0};
+    for (size_t i = 0; i < sizeof(positions) / sizeof(positions[0]); i++) {
+        ds4_tokens prompt = {0};
+        ds4_kvstore_tokens_copy_prefix(&prompt, all, positions[i]);
+        TEST_ASSERT(ds4_session_sync(source, &prompt,
+                                     err, sizeof(err)) == 0);
+        ds4_prefix_node *node = NULL;
+        TEST_ASSERT(ds4_session_prefix_node_capture(
+                        source, NULL, &node, err, sizeof(err)) == 0);
+        if (node) {
+            const ds4_prefix_node *chain[] = {node};
+            TEST_ASSERT(ds4_session_prefix_chain_restore(
+                            target, chain, 1, err, sizeof(err)) == 0);
+            const int na = ds4_session_copy_logits(source, a, 200000);
+            const int nb = ds4_session_copy_logits(target, b, 200000);
+            TEST_ASSERT(na > 0 && nb == na);
+            TEST_ASSERT(na <= 0 ||
+                        memcmp(a, b, (size_t)na * sizeof(float)) == 0);
+        }
+        ds4_prefix_node_free(node);
+        ds4_tokens_free(&prompt);
+    }
+
+done:
+    free(a);
+    free(b);
+    ds4_session_free(source);
+    ds4_session_free(target);
+}
+
+static bool test_token_prefix_equal(const ds4_tokens *prefix,
+                                    const ds4_tokens *full) {
+    return prefix && full && prefix->len <= full->len &&
+           (prefix->len == 0 ||
+            memcmp(prefix->v, full->v,
+                   (size_t)prefix->len * sizeof(prefix->v[0])) == 0);
+}
+
+static void test_prefix_tree_chinese_token_boundaries(ds4_engine *engine) {
+    buf chinese = {0};
+    for (int i = 0; i < 360; i++) {
+        buf_printf(&chinese,
+                   "第%03d段：春风穿过山谷，月光照亮归途；中文前缀必须保留精确分词。\n",
+                   i);
+    }
+    ds4_tokens full = {0};
+    ds4_tokenize_rendered_chat(engine, chinese.ptr, &full);
+    TEST_ASSERT(full.len > 1200);
+    if (full.len <= 1200) {
+        ds4_tokens_free(&full);
+        buf_free(&chinese);
+        return;
+    }
+
+    ds4_tokens stable = {0};
+    ds4_kvstore_tokens_copy_prefix(&stable, &full, 1024);
+    size_t stable_text_len = 0;
+    char *stable_text = ds4_kvstore_render_tokens_text(
+        engine, &stable, &stable_text_len);
+    TEST_ASSERT(stable_text != NULL &&
+                ds4_kvstore_byte_prefix_match(
+                    chinese.ptr, chinese.len, stable_text, stable_text_len));
+
+    ds4_session *source = NULL;
+    ds4_session *target = NULL;
+    ds4_kvstore store = {0};
+    char err[256] = {0};
+    TEST_ASSERT(ds4_session_create(&source, engine, 8192) == 0);
+    TEST_ASSERT(ds4_session_create(&target, engine, 8192) == 0);
+    TEST_ASSERT(ds4_kvstore_prefix_enable(&store, engine, 256, NULL));
+    if (source && target && stable_text) {
+        TEST_ASSERT(ds4_session_sync(source, &stable,
+                                     err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_kvstore_prefix_capture(
+                        &store, engine, source, NULL,
+                        err, sizeof(err)));
+        ds4_prefix_lookup lookup = {0};
+        TEST_ASSERT(ds4_kvstore_prefix_find(
+                        &store, chinese.ptr, &full, &lookup));
+        TEST_ASSERT(lookup.tokens == stable.len);
+        ds4_tokens effective = {0};
+        TEST_ASSERT(ds4_kvstore_prefix_restore(
+                        &store, engine, target, chinese.ptr, &full,
+                        &effective, &lookup, err, sizeof(err)) == stable.len);
+        TEST_ASSERT(effective.len == full.len &&
+                    test_token_prefix_equal(&effective, &full) &&
+                    test_token_prefix_equal(&full, &effective));
+        ds4_tokens_free(&effective);
+    }
+    ds4_kvstore_close(&store);
+    ds4_session_free(source);
+    ds4_session_free(target);
+
+    /* A standalone Chinese byte prefix can tokenize differently once another
+     * character follows it.  Such a checkpoint is a text match but not a safe
+     * KV match, and must be rejected before touching the live session. */
+    bool found_unstable = false;
+    for (size_t cut = 1; !found_unstable && cut < 768 && cut < chinese.len;
+         cut++) {
+        if (((unsigned char)chinese.ptr[cut] & 0xc0u) == 0x80u) continue;
+        char *prefix_text = malloc(cut + 1u);
+        TEST_ASSERT(prefix_text != NULL);
+        if (!prefix_text) break;
+        memcpy(prefix_text, chinese.ptr, cut);
+        prefix_text[cut] = '\0';
+        ds4_tokens standalone = {0};
+        ds4_tokenize_rendered_chat(engine, prefix_text, &standalone);
+        size_t rendered_len = 0;
+        char *rendered = ds4_kvstore_render_tokens_text(
+            engine, &standalone, &rendered_len);
+        const bool exact_text = rendered && rendered_len == cut &&
+            memcmp(rendered, prefix_text, cut) == 0;
+        if (exact_text && standalone.len > 0 &&
+            !test_token_prefix_equal(&standalone, &full)) {
+            ds4_session *unstable_session = NULL;
+            ds4_kvstore unstable_store = {0};
+            TEST_ASSERT(ds4_session_create(
+                            &unstable_session, engine, 8192) == 0);
+            TEST_ASSERT(ds4_kvstore_prefix_enable(
+                            &unstable_store, engine, 128, NULL));
+            if (unstable_session) {
+                TEST_ASSERT(ds4_session_sync(
+                                unstable_session, &standalone,
+                                err, sizeof(err)) == 0);
+                TEST_ASSERT(ds4_kvstore_prefix_capture(
+                                &unstable_store, engine, unstable_session,
+                                NULL, err, sizeof(err)));
+                ds4_prefix_lookup unsafe = {0};
+                TEST_ASSERT(!ds4_kvstore_prefix_find(
+                                &unstable_store, chinese.ptr, &full,
+                                &unsafe));
+            }
+            ds4_kvstore_close(&unstable_store);
+            ds4_session_free(unstable_session);
+            found_unstable = true;
+        }
+        free(rendered);
+        ds4_tokens_free(&standalone);
+        free(prefix_text);
+    }
+    TEST_ASSERT(found_unstable);
+
+    free(stable_text);
+    ds4_tokens_free(&stable);
+    ds4_tokens_free(&full);
+    buf_free(&chinese);
+}
+
+static void test_prefix_node_chain(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    buf generated = {0};
+    for (int i = 0; i < 900; i++) {
+        buf_printf(&generated,
+                   "Record %04d: immutable prefix checkpoints preserve exact "
+                   "terminal state across branches.\n", i);
+    }
+    ds4_tokens all = {0};
+    ds4_tokenize_text(engine, generated.ptr, &all);
+    TEST_ASSERT(all.len > 3200);
+    if (all.len <= 3200) {
+        ds4_tokens_free(&all);
+        buf_free(&generated);
+        return;
+    }
+    TEST_ASSERT(all.len > 4097);
+    if (all.len > 4097) test_prefix_node_boundaries(engine, &all);
+    test_prefix_tree_chinese_token_boundaries(engine);
+
+    ds4_tokens root_prompt = {0};
+    ds4_tokens child_prompt = {0};
+    for (int i = 0; i < 1024; i++)
+        ds4_tokens_push(&root_prompt, all.v[i]);
+    for (int i = 0; i < 3072; i++)
+        ds4_tokens_push(&child_prompt, all.v[i]);
+
+    ds4_session *live = NULL;
+    ds4_session *restored = NULL;
+    ds4_kvstore store = {0};
+    bool store_open = false;
+    char cache_template[] = "/tmp/ds4-prefix-tree-XXXXXX";
+    char *cache_dir = mkdtemp(cache_template);
+    TEST_ASSERT(cache_dir != NULL);
+    TEST_ASSERT(ds4_session_create(&live, engine, 8192) == 0);
+    TEST_ASSERT(ds4_session_create(&restored, engine, 8192) == 0);
+    if (!live || !restored || !cache_dir) goto cleanup;
+    store_open = ds4_kvstore_open(
+        &store, cache_dir, 512, true, ds4_kvstore_default_options(),
+        "ds4-test", NULL, NULL);
+    TEST_ASSERT(store_open);
+    TEST_ASSERT(store_open &&
+                ds4_kvstore_prefix_enable(&store, engine, 256, NULL));
+    if (!store_open || !ds4_kvstore_prefix_enabled(&store)) goto cleanup;
+
+    char err[256] = {0};
+    const double root_prefill_t0 = now_sec();
+    TEST_ASSERT(ds4_session_sync(live, &root_prompt, err, sizeof(err)) == 0);
+    const double root_prefill_ms = (now_sec() - root_prefill_t0) * 1000.0;
+
+    ds4_prefix_node *root = NULL;
+    ds4_prefix_node *child = NULL;
+    ds4_prefix_node *root_disk = NULL;
+    ds4_prefix_node *child_disk = NULL;
+    const double root_capture_t0 = now_sec();
+    TEST_ASSERT(ds4_session_prefix_node_capture(
+                    live, NULL, &root, err, sizeof(err)) == 0);
+    const double root_capture_ms = (now_sec() - root_capture_t0) * 1000.0;
+    TEST_ASSERT(root != NULL);
+    if (!root) goto node_cleanup;
+    TEST_ASSERT(ds4_kvstore_prefix_capture(
+                    &store, engine, live, NULL, err, sizeof(err)));
+
+    const double child_prefill_t0 = now_sec();
+    TEST_ASSERT(ds4_session_sync(live, &child_prompt, err, sizeof(err)) == 0);
+    const double child_prefill_ms = (now_sec() - child_prefill_t0) * 1000.0;
+    const uint64_t full_payload_bytes = ds4_session_payload_bytes(live);
+    const double child_capture_t0 = now_sec();
+    TEST_ASSERT(ds4_session_prefix_node_capture(
+                    live, root, &child, err, sizeof(err)) == 0);
+    const double child_capture_ms = (now_sec() - child_capture_t0) * 1000.0;
+    TEST_ASSERT(child != NULL);
+    if (!child) goto node_cleanup;
+    TEST_ASSERT(ds4_kvstore_prefix_capture(
+                    &store, engine, live, NULL, err, sizeof(err)));
+    ds4_kvstore_prefix_wait_idle(&store);
+
+    TEST_ASSERT(ds4_prefix_node_parent_tokens(root) == 0);
+    TEST_ASSERT(ds4_prefix_node_total_tokens(root) == 1024);
+    TEST_ASSERT(ds4_prefix_node_parent_tokens(child) == 1024);
+    TEST_ASSERT(ds4_prefix_node_total_tokens(child) == 3072);
+    TEST_ASSERT(ds4_prefix_node_compat_id(root) ==
+                ds4_prefix_node_compat_id(child));
+    TEST_ASSERT(ds4_prefix_node_bytes(child) < full_payload_bytes);
+
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    if (!fp) goto node_cleanup;
+    TEST_ASSERT(ds4_prefix_node_write(root, fp, err, sizeof(err)) == 0);
+    rewind(fp);
+    TEST_ASSERT(ds4_prefix_node_read(
+                    engine, fp, ds4_prefix_node_bytes(root), &root_disk,
+                    err, sizeof(err)) == 0);
+    fclose(fp);
+
+    fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    if (!fp) goto node_cleanup;
+    TEST_ASSERT(ds4_prefix_node_write(child, fp, err, sizeof(err)) == 0);
+    rewind(fp);
+    TEST_ASSERT(ds4_prefix_node_read(
+                    engine, fp, ds4_prefix_node_bytes(child), &child_disk,
+                    err, sizeof(err)) == 0);
+    fclose(fp);
+    TEST_ASSERT(root_disk != NULL && child_disk != NULL);
+    if (!root_disk || !child_disk) goto node_cleanup;
+
+    size_t root_text_len = 0, child_text_len = 0;
+    char *root_text = ds4_kvstore_render_tokens_text(
+        engine, &root_prompt, &root_text_len);
+    char *child_text = ds4_kvstore_render_tokens_text(
+        engine, &child_prompt, &child_text_len);
+    TEST_ASSERT(root_text != NULL && child_text != NULL);
+    if (!root_text || !child_text) {
+        free(root_text);
+        free(child_text);
+        goto node_cleanup;
+    }
+    ds4_prefix_stats prefix_stats = {0};
+    ds4_kvstore_prefix_stats(&store, &prefix_stats);
+    TEST_ASSERT(prefix_stats.nodes == 2);
+    TEST_ASSERT(prefix_stats.durable_nodes == 2);
+    TEST_ASSERT(prefix_stats.pending_nodes == 0);
+    TEST_ASSERT(prefix_stats.ram_bytes <= 256ull * 1024ull * 1024ull);
+    TEST_ASSERT(prefix_stats.disk_bytes <= 512ull * 1024ull * 1024ull);
+
+    ds4_prefix_lookup lookup = {0};
+    TEST_ASSERT(ds4_kvstore_prefix_find(
+                    &store, child_text, &child_prompt, &lookup));
+    TEST_ASSERT(lookup.tokens == child_prompt.len);
+    TEST_ASSERT(lookup.text_bytes == child_text_len);
+    TEST_ASSERT(lookup.ram_resident);
+
+    ds4_tokens mid_prompt = {0};
+    ds4_kvstore_tokens_copy_prefix(&mid_prompt, &all, 1500);
+    size_t mid_text_len = 0;
+    char *mid_text = ds4_kvstore_render_tokens_text(
+        engine, &mid_prompt, &mid_text_len);
+    ds4_tokens effective = {0};
+    memset(&lookup, 0, sizeof(lookup));
+    TEST_ASSERT(ds4_kvstore_prefix_restore(
+                    &store, engine, restored, mid_text, &mid_prompt, &effective,
+                    &lookup, err, sizeof(err)) == root_prompt.len);
+    TEST_ASSERT(lookup.tokens == root_prompt.len);
+    TEST_ASSERT(effective.len >= root_prompt.len);
+    TEST_ASSERT(ds4_session_sync(restored, &effective,
+                                 err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_pos(restored) == effective.len);
+    ds4_tokens_free(&effective);
+    ds4_tokens_free(&mid_prompt);
+    free(mid_text);
+
+    for (int branch = 0; branch < 3; branch++) {
+        memset(&lookup, 0, sizeof(lookup));
+        TEST_ASSERT(ds4_kvstore_prefix_restore(
+                        &store, engine, restored, root_text, &root_prompt,
+                        &effective,
+                        &lookup, err, sizeof(err)) == root_prompt.len);
+        ds4_tokens branch_prompt = {0};
+        ds4_kvstore_tokens_copy_prefix(
+            &branch_prompt, ds4_session_tokens(restored), root_prompt.len);
+        char suffix_text[1024];
+        snprintf(suffix_text, sizeof(suffix_text),
+                 "\nIndependent branch %d: this terminal is deliberately "
+                 "variable length and shares only the immutable root. "
+                 "Its final few tokens remain latency-sensitive.\n",
+                 branch);
+        ds4_tokens suffix = {0};
+        ds4_tokenize_text(engine, suffix_text, &suffix);
+        for (int i = 0; i < suffix.len; i++)
+            ds4_tokens_push(&branch_prompt, suffix.v[i]);
+        TEST_ASSERT(ds4_session_sync(restored, &branch_prompt,
+                                     err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_kvstore_prefix_capture(
+                        &store, engine, restored, NULL, err, sizeof(err)));
+        ds4_tokens_free(&suffix);
+        ds4_tokens_free(&branch_prompt);
+        ds4_tokens_free(&effective);
+    }
+    ds4_kvstore_prefix_wait_idle(&store);
+    ds4_kvstore_prefix_stats(&store, &prefix_stats);
+    TEST_ASSERT(prefix_stats.nodes == 5);
+    TEST_ASSERT(prefix_stats.durable_nodes == 5);
+    TEST_ASSERT(prefix_stats.pending_nodes == 0);
+
+    TEST_ASSERT(ds4_kvstore_store_live_prefix(
+                    &store, engine, live, &child_prompt, child_prompt.len,
+                    "cold", NULL, err, sizeof(err)));
+    double kvc_times[5] = {0}, tree_times[5] = {0};
+    for (int sample = 0; sample < 5; sample++) {
+        ds4_kvstore_load_result kvc_result = {0};
+        const double kvc_t0 = now_sec();
+        TEST_ASSERT(ds4_kvstore_try_load_text(
+                        &store, engine, restored, child_text, &effective,
+                        &kvc_result, NULL, false) == child_prompt.len);
+        kvc_times[sample] = (now_sec() - kvc_t0) * 1000.0;
+        ds4_kvstore_load_result_free(&kvc_result);
+        ds4_tokens_free(&effective);
+
+        const double tree_t0 = now_sec();
+        TEST_ASSERT(ds4_kvstore_prefix_restore(
+                        &store, engine, restored, child_text, &child_prompt,
+                        &effective,
+                        &lookup, err, sizeof(err)) == child_prompt.len);
+        tree_times[sample] = (now_sec() - tree_t0) * 1000.0;
+        ds4_tokens_free(&effective);
+    }
+    for (int i = 1; i < 5; i++) {
+        for (int j = i; j > 0 && kvc_times[j] < kvc_times[j - 1]; j--) {
+            double tmp = kvc_times[j];
+            kvc_times[j] = kvc_times[j - 1];
+            kvc_times[j - 1] = tmp;
+        }
+        for (int j = i; j > 0 && tree_times[j] < tree_times[j - 1]; j--) {
+            double tmp = tree_times[j];
+            tree_times[j] = tree_times[j - 1];
+            tree_times[j - 1] = tmp;
+        }
+    }
+    const double kvc_restore_ms = kvc_times[2];
+    const double tree_ram_restore_ms = tree_times[2];
+    TEST_ASSERT(tree_ram_restore_ms <= kvc_restore_ms * 1.10);
+
+    ds4_kvstore_close(&store);
+    store_open = false;
+    store_open = ds4_kvstore_open(
+        &store, cache_dir, 512, true, ds4_kvstore_default_options(),
+        "ds4-test", NULL, NULL);
+    TEST_ASSERT(store_open &&
+                ds4_kvstore_prefix_enable(&store, engine, 256, NULL));
+    ds4_kvstore_prefix_stats(&store, &prefix_stats);
+    TEST_ASSERT(prefix_stats.nodes == 5);
+    TEST_ASSERT(prefix_stats.durable_nodes == 5);
+    TEST_ASSERT(prefix_stats.ram_nodes == 0);
+    const double tree_disk_t0 = now_sec();
+    TEST_ASSERT(ds4_kvstore_prefix_restore(
+                    &store, engine, restored, child_text, &child_prompt,
+                    &effective,
+                    &lookup, err, sizeof(err)) == child_prompt.len);
+    const double tree_disk_restore_ms = (now_sec() - tree_disk_t0) * 1000.0;
+    ds4_tokens_free(&effective);
+    fprintf(stderr,
+            "ds4-test: prefix-tree nodes=%llu durable=%llu RAM=%.2fMiB "
+            "disk=%.2fMiB restore_ram=%.1fms restore_disk=%.1fms "
+            "kvc_restore=%.1fms\n",
+            (unsigned long long)prefix_stats.nodes,
+            (unsigned long long)prefix_stats.durable_nodes,
+            (double)prefix_stats.ram_bytes / (1024.0 * 1024.0),
+            (double)prefix_stats.disk_bytes / (1024.0 * 1024.0),
+            tree_ram_restore_ms, tree_disk_restore_ms, kvc_restore_ms);
+
+    ds4_kvstore_close(&store);
+    store_open = false;
+    TEST_ASSERT(test_truncate_one_prefix_file(cache_dir));
+    store_open = ds4_kvstore_open(
+        &store, cache_dir, 512, true, ds4_kvstore_default_options(),
+        "ds4-test", NULL, NULL);
+    TEST_ASSERT(store_open &&
+                ds4_kvstore_prefix_enable(&store, engine, 256, NULL));
+    ds4_kvstore_prefix_stats(&store, &prefix_stats);
+    TEST_ASSERT(prefix_stats.nodes < 5);
+    TEST_ASSERT(prefix_stats.pending_nodes == 0);
+
+    ds4_kvstore tiny_ram = {0};
+    TEST_ASSERT(ds4_kvstore_prefix_enable(&tiny_ram, engine, 1, NULL));
+    TEST_ASSERT(!ds4_kvstore_prefix_capture(
+                    &tiny_ram, engine, live, NULL, err, sizeof(err)));
+    ds4_kvstore_prefix_stats(&tiny_ram, &prefix_stats);
+    TEST_ASSERT(prefix_stats.nodes == 0);
+    TEST_ASSERT(prefix_stats.ram_bytes <= 1024ull * 1024ull);
+    ds4_kvstore_close(&tiny_ram);
+
+    char disk_template[] = "/tmp/ds4-prefix-budget-XXXXXX";
+    char *disk_dir = mkdtemp(disk_template);
+    ds4_kvstore tiny_disk = {0};
+    TEST_ASSERT(disk_dir != NULL);
+    if (disk_dir) {
+        TEST_ASSERT(ds4_kvstore_open(
+                        &tiny_disk, disk_dir, 1, true,
+                        ds4_kvstore_default_options(),
+                        "ds4-test", NULL, NULL));
+        TEST_ASSERT(ds4_kvstore_prefix_enable(&tiny_disk, engine, 128, NULL));
+        TEST_ASSERT(ds4_kvstore_prefix_capture(
+                        &tiny_disk, engine, live, NULL,
+                        err, sizeof(err)));
+        ds4_kvstore_prefix_wait_idle(&tiny_disk);
+        ds4_kvstore_prefix_stats(&tiny_disk, &prefix_stats);
+        TEST_ASSERT(prefix_stats.nodes == 1);
+        TEST_ASSERT(prefix_stats.durable_nodes == 0);
+        TEST_ASSERT(prefix_stats.pending_nodes == 0);
+        TEST_ASSERT(prefix_stats.disk_bytes == 0);
+        TEST_ASSERT(prefix_stats.ram_bytes <= 128ull * 1024ull * 1024ull);
+        ds4_kvstore_close(&tiny_disk);
+        test_remove_prefix_cache_dir(disk_dir);
+    }
+
+    char gc_template[] = "/tmp/ds4-prefix-gc-XXXXXX";
+    char *gc_dir = mkdtemp(gc_template);
+    ds4_kvstore gc_store = {0};
+    TEST_ASSERT(gc_dir != NULL);
+    if (gc_dir) {
+        TEST_ASSERT(ds4_kvstore_open(
+                        &gc_store, gc_dir, 70, true,
+                        ds4_kvstore_default_options(),
+                        "ds4-test", NULL, NULL));
+        TEST_ASSERT(ds4_kvstore_prefix_enable(&gc_store, engine, 128, NULL));
+        const ds4_prefix_node *root_chain[] = {root};
+        TEST_ASSERT(ds4_session_prefix_chain_restore(
+                        restored, root_chain, 1, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_kvstore_prefix_capture(
+                        &gc_store, engine, restored, NULL,
+                        err, sizeof(err)));
+        ds4_kvstore_prefix_wait_idle(&gc_store);
+        for (int branch = 0; branch < 2; branch++) {
+            TEST_ASSERT(ds4_kvstore_prefix_restore(
+                            &gc_store, engine, restored, root_text, &root_prompt,
+                            &effective, &lookup,
+                            err, sizeof(err)) == root_prompt.len);
+            ds4_tokens branch_prompt = {0};
+            ds4_kvstore_tokens_copy_prefix(
+                &branch_prompt, ds4_session_tokens(restored),
+                root_prompt.len);
+            char suffix_text[512];
+            snprintf(suffix_text, sizeof(suffix_text),
+                     "\nGC branch %d keeps the root durable and replaces only "
+                     "the oldest leaf under disk pressure.\n", branch);
+            ds4_tokens suffix = {0};
+            ds4_tokenize_text(engine, suffix_text, &suffix);
+            for (int i = 0; i < suffix.len; i++)
+                ds4_tokens_push(&branch_prompt, suffix.v[i]);
+            TEST_ASSERT(ds4_session_sync(restored, &branch_prompt,
+                                         err, sizeof(err)) == 0);
+            TEST_ASSERT(ds4_kvstore_prefix_capture(
+                            &gc_store, engine, restored, NULL,
+                            err, sizeof(err)));
+            ds4_kvstore_prefix_wait_idle(&gc_store);
+            ds4_tokens_free(&suffix);
+            ds4_tokens_free(&branch_prompt);
+            ds4_tokens_free(&effective);
+        }
+        ds4_kvstore_prefix_stats(&gc_store, &prefix_stats);
+        TEST_ASSERT(prefix_stats.nodes == 3);
+        TEST_ASSERT(prefix_stats.durable_nodes == 2);
+        TEST_ASSERT(prefix_stats.pending_nodes == 0);
+        TEST_ASSERT(prefix_stats.disk_bytes <= 70ull * 1024ull * 1024ull);
+        ds4_kvstore_close(&gc_store);
+        TEST_ASSERT(ds4_kvstore_open(
+                        &gc_store, gc_dir, 70, true,
+                        ds4_kvstore_default_options(),
+                        "ds4-test", NULL, NULL));
+        TEST_ASSERT(ds4_kvstore_prefix_enable(&gc_store, engine, 128, NULL));
+        ds4_kvstore_prefix_stats(&gc_store, &prefix_stats);
+        TEST_ASSERT(prefix_stats.nodes == 2);
+        TEST_ASSERT(prefix_stats.durable_nodes == 2);
+        ds4_kvstore_close(&gc_store);
+        test_remove_prefix_cache_dir(gc_dir);
+    }
+
+    free(root_text);
+    free(child_text);
+
+    const ds4_prefix_node *missing_root[] = {child_disk};
+    TEST_ASSERT(ds4_session_prefix_chain_restore(
+                    restored, missing_root, 1, err, sizeof(err)) != 0);
+
+    fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        ds4_prefix_node *truncated = NULL;
+        TEST_ASSERT(ds4_prefix_node_write(child, fp, err, sizeof(err)) == 0);
+        rewind(fp);
+        TEST_ASSERT(ds4_prefix_node_read(
+                        engine, fp, ds4_prefix_node_bytes(child) - 1,
+                        &truncated, err, sizeof(err)) != 0);
+        TEST_ASSERT(truncated == NULL);
+        fclose(fp);
+    }
+
+    fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        ds4_prefix_node *corrupt = NULL;
+        TEST_ASSERT(ds4_prefix_node_write(child, fp, err, sizeof(err)) == 0);
+        TEST_ASSERT(fseeko(fp, (off_t)ds4_prefix_node_bytes(child) - 1,
+                           SEEK_SET) == 0);
+        int byte = fgetc(fp);
+        TEST_ASSERT(byte != EOF);
+        TEST_ASSERT(fseeko(fp, (off_t)ds4_prefix_node_bytes(child) - 1,
+                           SEEK_SET) == 0);
+        TEST_ASSERT(fputc(byte ^ 0x5a, fp) != EOF);
+        rewind(fp);
+        TEST_ASSERT(ds4_prefix_node_read(
+                        engine, fp, ds4_prefix_node_bytes(child),
+                        &corrupt, err, sizeof(err)) != 0);
+        TEST_ASSERT(corrupt == NULL);
+        fclose(fp);
+    }
+
+    const int logits_cap = 200000;
+    float *live_logits = malloc((size_t)logits_cap * sizeof(float));
+    float *restored_logits = malloc((size_t)logits_cap * sizeof(float));
+    TEST_ASSERT(live_logits != NULL && restored_logits != NULL);
+    int reference[256] = {0};
+    if (live_logits && restored_logits) {
+        const int n_logits = ds4_session_copy_logits(
+                live, live_logits, logits_cap);
+        TEST_ASSERT(n_logits > 0 && n_logits <= logits_cap);
+        for (int i = 0; i < 256; i++) {
+            reference[i] = ds4_session_argmax(live);
+            TEST_ASSERT(ds4_session_eval(
+                            live, reference[i], err, sizeof(err)) == 0);
+        }
+
+        const ds4_prefix_node *chain[] = {root_disk, child_disk};
+        const double restore_t0 = now_sec();
+        TEST_ASSERT(ds4_session_prefix_chain_restore(
+                        restored, chain, 2, err, sizeof(err)) == 0);
+        const double restore_ms = (now_sec() - restore_t0) * 1000.0;
+        TEST_ASSERT(ds4_session_copy_logits(
+                        restored, restored_logits,
+                        logits_cap) == n_logits);
+        TEST_ASSERT(memcmp(live_logits, restored_logits,
+                           (size_t)n_logits * sizeof(float)) == 0);
+        for (int i = 0; i < 256; i++) {
+            TEST_ASSERT(ds4_session_argmax(restored) == reference[i]);
+            TEST_ASSERT(ds4_session_eval(
+                            restored, reference[i], err, sizeof(err)) == 0);
+        }
+        fprintf(stderr,
+                "ds4-test: prefix-node root_prefill=%.1fms "
+                "root_capture=%.1fms child_prefill=%.1fms "
+                "child_capture=%.1fms capture_ratio=%.2f%% "
+                "restore=%.1fms root=%.2fMiB child=%.2fMiB full=%.2fMiB\n",
+                root_prefill_ms, root_capture_ms,
+                child_prefill_ms, child_capture_ms,
+                child_prefill_ms > 0.0
+                    ? child_capture_ms * 100.0 / child_prefill_ms : 0.0,
+                restore_ms,
+                (double)ds4_prefix_node_bytes(root) / (1024.0 * 1024.0),
+                (double)ds4_prefix_node_bytes(child) / (1024.0 * 1024.0),
+                (double)full_payload_bytes / (1024.0 * 1024.0));
+        TEST_ASSERT(child_prefill_ms <= 0.0 ||
+                    child_capture_ms / child_prefill_ms < 0.05);
+    }
+    free(live_logits);
+    free(restored_logits);
+
+node_cleanup:
+    ds4_prefix_node_free(root_disk);
+    ds4_prefix_node_free(child_disk);
+    ds4_prefix_node_free(root);
+    ds4_prefix_node_free(child);
+cleanup:
+    if (store_open) ds4_kvstore_close(&store);
+    if (cache_dir) test_remove_prefix_cache_dir(cache_dir);
+    ds4_session_free(live);
+    ds4_session_free(restored);
+    ds4_tokens_free(&root_prompt);
+    ds4_tokens_free(&child_prompt);
+    ds4_tokens_free(&all);
+    buf_free(&generated);
+}
+
 static char *test_read_file(const char *path) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return NULL;
@@ -6588,6 +7254,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-ssd-streaming-cache-pressure", "metal-ssd-streaming-cache-pressure", "Metal SSD-streaming layer-batched decode cache-pressure repro for issue #384", test_metal_ssd_streaming_cache_pressure},
     {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long Metal prefill", test_local_golden_vectors},
     {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
+    {"--prefix-node-chain", "prefix-node-chain", "immutable Flash prefix-node capture, persistence, restore, and cost", test_prefix_node_chain},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},

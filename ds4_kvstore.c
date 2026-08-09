@@ -13,6 +13,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,6 +55,112 @@
  * survive comparable continued entries, while still allowing pressure and poor
  * density to evict them. */
 #define KV_CACHE_ANCHOR_REASON_SCORE_FACTOR 2.0
+
+#define PREFIX_FILE_HEADER 176u
+#define PREFIX_FILE_VERSION 1u
+
+typedef enum {
+    PREFIX_RAM_ONLY,
+    PREFIX_WRITE_QUEUED,
+    PREFIX_WRITING,
+    PREFIX_DURABLE,
+    PREFIX_FAILED,
+} prefix_state;
+
+typedef struct prefix_entry {
+    char node_id[41];
+    char parent_id[41];
+    char prefix_sha[41];
+    char *text;
+    size_t text_len;
+    char *path;
+    ds4_prefix_node *node;
+    uint64_t compat_id;
+    uint64_t token_hash;
+    uint64_t node_bytes;
+    uint64_t file_bytes;
+    uint64_t last_used;
+    uint32_t parent_tokens;
+    uint32_t total_tokens;
+    uint32_t child_count;
+    uint32_t pin_count;
+    prefix_state state;
+} prefix_entry;
+
+struct ds4_prefix_cache {
+    ds4_kvstore *owner;
+    ds4_engine *engine;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    pthread_t writer;
+    bool writer_started;
+    bool stopping;
+    bool writer_busy;
+    uint64_t clock;
+    uint64_t ram_budget;
+    uint64_t ram_bytes;
+    uint64_t reserved_ram_bytes;
+    uint64_t disk_bytes;
+    uint64_t reserved_disk_bytes;
+    uint64_t reserved_kvc_bytes;
+    pthread_mutex_t *inference_mu;
+    char *dir;
+    prefix_entry **entry;
+    size_t len;
+    size_t cap;
+};
+
+static void prefix_cache_destroy(ds4_kvstore *kc);
+
+static uint64_t prefix_disk_claimed_bytes(const ds4_kvstore *kc) {
+    if (!kc || !kc->prefix) return 0;
+    struct ds4_prefix_cache *pc = kc->prefix;
+    pthread_mutex_lock(&pc->mu);
+    uint64_t claimed = pc->disk_bytes;
+    if (UINT64_MAX - claimed < pc->reserved_disk_bytes) {
+        claimed = UINT64_MAX;
+    } else {
+        claimed += pc->reserved_disk_bytes;
+    }
+    if (UINT64_MAX - claimed < pc->reserved_kvc_bytes) {
+        claimed = UINT64_MAX;
+    } else {
+        claimed += pc->reserved_kvc_bytes;
+    }
+    pthread_mutex_unlock(&pc->mu);
+    return claimed;
+}
+
+static bool prefix_reserve_kvc_bytes(ds4_kvstore *kc, uint64_t kvc_bytes,
+                                     uint64_t incoming_bytes) {
+    if (!kc || !kc->prefix || kc->budget_bytes == 0) return true;
+    struct ds4_prefix_cache *pc = kc->prefix;
+    pthread_mutex_lock(&pc->mu);
+    uint64_t total = pc->disk_bytes;
+    bool ok = UINT64_MAX - total >= pc->reserved_disk_bytes;
+    if (ok) total += pc->reserved_disk_bytes;
+    if (ok) ok = UINT64_MAX - total >= pc->reserved_kvc_bytes;
+    if (ok) total += pc->reserved_kvc_bytes;
+    if (ok) ok = UINT64_MAX - total >= kvc_bytes;
+    if (ok) total += kvc_bytes;
+    if (ok) ok = UINT64_MAX - total >= incoming_bytes;
+    if (ok) total += incoming_bytes;
+    ok = ok && total <= kc->budget_bytes &&
+         UINT64_MAX - pc->reserved_kvc_bytes >= incoming_bytes;
+    if (ok) pc->reserved_kvc_bytes += incoming_bytes;
+    pthread_mutex_unlock(&pc->mu);
+    return ok;
+}
+
+static void prefix_release_kvc_bytes(ds4_kvstore *kc, uint64_t bytes) {
+    if (!kc || !kc->prefix || bytes == 0) return;
+    struct ds4_prefix_cache *pc = kc->prefix;
+    pthread_mutex_lock(&pc->mu);
+    if (pc->reserved_kvc_bytes >= bytes) pc->reserved_kvc_bytes -= bytes;
+    else pc->reserved_kvc_bytes = 0;
+    pthread_cond_broadcast(&pc->cv);
+    pthread_mutex_unlock(&pc->mu);
+}
 
 typedef struct {
     char *ptr;
@@ -567,7 +674,10 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
     const uint64_t now = (uint64_t)time(NULL);
     uint64_t total = 0;
     for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
-    const uint64_t target = kc->budget_bytes - extra_bytes;
+    const uint64_t tree_claimed = prefix_disk_claimed_bytes(kc);
+    uint64_t target = kc->budget_bytes - extra_bytes;
+    if (tree_claimed >= target) target = 0;
+    else target -= tree_claimed;
     while (total > target && kc->len > 0) {
         int victim = 0;
         double victim_score =
@@ -645,6 +755,7 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
 }
 
 void ds4_kvstore_close(ds4_kvstore *kc) {
+    prefix_cache_destroy(kc);
     ds4_kvstore_clear(kc);
     free(kc->dir);
     memset(kc, 0, sizeof(*kc));
@@ -1051,6 +1162,25 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     };
     ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
 
+    uint64_t kvc_bytes = 0;
+    for (int i = 0; i < kc->len; i++) {
+        if (UINT64_MAX - kvc_bytes < kc->entry[i].file_size) {
+            kvc_bytes = UINT64_MAX;
+            break;
+        }
+        kvc_bytes += kc->entry[i].file_size;
+    }
+    if (!prefix_reserve_kvc_bytes(kc, kvc_bytes, est_file_bytes)) {
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache skipped tokens=%d reason=%s because the shared KVC/tree disk budget is full",
+                kv_log_name(kc), store_tokens.len, reason);
+        ds4_session_payload_file_free(&staged);
+        free(text);
+        free(path);
+        ds4_tokens_free(&store_tokens);
+        return false;
+    }
+
     kv_buf tmpb = {0};
     kv_buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());
     char *tmp = kv_buf_take(&tmpb);
@@ -1062,6 +1192,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 kv_log_name(kc), tmp, strerror(errno),
                 (kv_now_sec() - save_t0) * 1000.0);
         ds4_session_payload_file_free(&staged);
+        prefix_release_kvc_bytes(kc, est_file_bytes);
         free(tmp);
         free(text);
         free(path);
@@ -1104,11 +1235,16 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         final_size_over_budget = true;
         ok = false;
     }
+    if (ok && final_file_bytes > est_file_bytes) {
+        final_size_over_budget = true;
+        ok = false;
+    }
     if (ok && rename(tmp, path) != 0) {
         saved_errno = errno;
         ok = false;
     }
     const double save_ms = (kv_now_sec() - save_t0) * 1000.0;
+    prefix_release_kvc_bytes(kc, est_file_bytes);
     if (!ok) {
         if (final_size_over_budget) {
             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
@@ -1343,4 +1479,1054 @@ void ds4_kvstore_load_result_free(ds4_kvstore_load_result *result) {
     if (!result) return;
     free(result->path);
     memset(result, 0, sizeof(*result));
+}
+
+static void prefix_put64(uint8_t *p, uint64_t v) {
+    ds4_kvstore_le_put32(p, (uint32_t)v);
+    ds4_kvstore_le_put32(p + 4, (uint32_t)(v >> 32));
+}
+
+static uint64_t prefix_get64(const uint8_t *p) {
+    return (uint64_t)ds4_kvstore_le_get32(p) |
+           ((uint64_t)ds4_kvstore_le_get32(p + 4) << 32);
+}
+
+static uint64_t *prefix_prompt_token_hashes(const ds4_tokens *tokens) {
+    if (!tokens || tokens->len < 0 ||
+        (size_t)tokens->len > SIZE_MAX / sizeof(uint64_t) - 1u)
+        return NULL;
+    uint64_t *hashes = kv_xmalloc(
+        ((size_t)tokens->len + 1u) * sizeof(hashes[0]));
+    hashes[0] = UINT64_C(1469598103934665603);
+    for (int i = 0; i < tokens->len; i++) {
+        const uint32_t token = (uint32_t)tokens->v[i];
+        uint64_t h = hashes[i];
+        for (unsigned byte = 0; byte < 8; byte++) {
+            h ^= (uint8_t)((uint64_t)token >> (byte * 8));
+            h *= UINT64_C(1099511628211);
+        }
+        hashes[i + 1] = h;
+    }
+    return hashes;
+}
+
+static void prefix_node_id(const char *parent_id,
+                           const ds4_prefix_node *node,
+                           char out[41]) {
+    uint8_t identity[72] = {0};
+    if (parent_id) memcpy(identity, parent_id, strlen(parent_id));
+    uint64_t digest[2] = {0};
+    ds4_prefix_node_digest(node, digest);
+    prefix_put64(identity + 40, digest[0]);
+    prefix_put64(identity + 48, digest[1]);
+    prefix_put64(identity + 56, ds4_prefix_node_compat_id(node));
+    ds4_kvstore_le_put32(identity + 64,
+                         ds4_prefix_node_parent_tokens(node));
+    ds4_kvstore_le_put32(identity + 68,
+                         ds4_prefix_node_total_tokens(node));
+    ds4_kvstore_sha1_bytes_hex(identity, sizeof(identity), out);
+}
+
+static prefix_entry *prefix_entry_new(void) {
+    prefix_entry *e = kv_xmalloc(sizeof(*e));
+    memset(e, 0, sizeof(*e));
+    return e;
+}
+
+static void prefix_entry_free(prefix_entry *e) {
+    if (!e) return;
+    free(e->text);
+    free(e->path);
+    ds4_prefix_node_free(e->node);
+    free(e);
+}
+
+static prefix_entry *prefix_find_id_locked(struct ds4_prefix_cache *pc,
+                                           const char *id) {
+    if (!pc || !id || !id[0]) return NULL;
+    for (size_t i = 0; i < pc->len; i++) {
+        if (!strcmp(pc->entry[i]->node_id, id)) return pc->entry[i];
+    }
+    return NULL;
+}
+
+static size_t prefix_index_locked(struct ds4_prefix_cache *pc,
+                                  prefix_entry *entry) {
+    for (size_t i = 0; i < pc->len; i++) {
+        if (pc->entry[i] == entry) return i;
+    }
+    return SIZE_MAX;
+}
+
+static void prefix_add_locked(struct ds4_prefix_cache *pc, prefix_entry *e) {
+    if (pc->len == pc->cap) {
+        size_t cap = pc->cap ? pc->cap * 2u : 64u;
+        pc->entry = kv_xrealloc(pc->entry, cap * sizeof(pc->entry[0]));
+        pc->cap = cap;
+    }
+    pc->entry[pc->len++] = e;
+}
+
+static void prefix_remove_index_locked(struct ds4_prefix_cache *pc, size_t idx) {
+    if (!pc || idx >= pc->len) return;
+    prefix_entry *e = pc->entry[idx];
+    prefix_entry *parent = prefix_find_id_locked(pc, e->parent_id);
+    if (parent && parent->child_count) parent->child_count--;
+    if (e->node) {
+        if (pc->ram_bytes >= e->node_bytes) pc->ram_bytes -= e->node_bytes;
+        else pc->ram_bytes = 0;
+    }
+    if (e->state == PREFIX_DURABLE) {
+        if (pc->disk_bytes >= e->file_bytes) pc->disk_bytes -= e->file_bytes;
+        else pc->disk_bytes = 0;
+    } else if (e->state == PREFIX_WRITE_QUEUED) {
+        if (pc->reserved_disk_bytes >= e->file_bytes)
+            pc->reserved_disk_bytes -= e->file_bytes;
+        else pc->reserved_disk_bytes = 0;
+    }
+    memmove(pc->entry + idx, pc->entry + idx + 1u,
+            (pc->len - idx - 1u) * sizeof(pc->entry[0]));
+    pc->len--;
+    prefix_entry_free(e);
+}
+
+static bool prefix_victim_before(const prefix_entry *a,
+                                 const prefix_entry *b) {
+    if (!b) return true;
+    if (a->last_used != b->last_used) return a->last_used < b->last_used;
+    if (a->total_tokens != b->total_tokens)
+        return a->total_tokens > b->total_tokens;
+    return strcmp(a->node_id, b->node_id) < 0;
+}
+
+static void prefix_trim_ram_locked(struct ds4_prefix_cache *pc) {
+    while (pc->reserved_ram_bytes > pc->ram_budget ||
+           pc->ram_bytes > pc->ram_budget - pc->reserved_ram_bytes) {
+        prefix_entry *victim = NULL;
+        for (size_t i = 0; i < pc->len; i++) {
+            prefix_entry *e = pc->entry[i];
+            if (!e->node || e->pin_count != 0 ||
+                e->state == PREFIX_WRITING ||
+                e->state == PREFIX_WRITE_QUEUED)
+                continue;
+            if (e->state != PREFIX_DURABLE && e->child_count != 0) continue;
+            if (prefix_victim_before(e, victim)) victim = e;
+        }
+        if (!victim) break;
+        if (victim->state == PREFIX_DURABLE) {
+            ds4_prefix_node_free(victim->node);
+            victim->node = NULL;
+            if (pc->ram_bytes >= victim->node_bytes)
+                pc->ram_bytes -= victim->node_bytes;
+            else
+                pc->ram_bytes = 0;
+        } else {
+            const size_t idx = prefix_index_locked(pc, victim);
+            if (idx == SIZE_MAX) break;
+            prefix_remove_index_locked(pc, idx);
+        }
+    }
+}
+
+static uint64_t prefix_kvc_bytes(const ds4_kvstore *kc) {
+    uint64_t total = 0;
+    if (!kc || !kc->dir) return 0;
+    DIR *dir = opendir(kc->dir);
+    if (!dir) return 0;
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        char sha[41];
+        if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) continue;
+        char *path = ds4_kvstore_path_join(kc->dir, de->d_name);
+        struct stat st;
+        const bool ok = stat(path, &st) == 0 && st.st_size >= 0;
+        free(path);
+        if (!ok) continue;
+        if (UINT64_MAX - total < (uint64_t)st.st_size) {
+            total = UINT64_MAX;
+            break;
+        }
+        total += (uint64_t)st.st_size;
+    }
+    closedir(dir);
+    return total;
+}
+
+static void prefix_cancel_writes_locked(struct ds4_prefix_cache *pc,
+                                        prefix_entry *root) {
+    if (!pc || !root) return;
+    for (size_t pass = 0; pass <= pc->len; pass++) {
+        bool changed = false;
+        for (size_t i = 0; i < pc->len; i++) {
+            prefix_entry *e = pc->entry[i];
+            bool dependent = e == root;
+            if (!dependent && e->parent_id[0]) {
+                prefix_entry *parent = prefix_find_id_locked(pc, e->parent_id);
+                dependent = parent &&
+                    (parent->state == PREFIX_RAM_ONLY ||
+                     parent->state == PREFIX_FAILED);
+            }
+            if (!dependent || e->state == PREFIX_DURABLE ||
+                e->state == PREFIX_RAM_ONLY || e->state == PREFIX_FAILED)
+                continue;
+            if (e->state == PREFIX_WRITE_QUEUED) {
+                if (pc->reserved_disk_bytes >= e->file_bytes)
+                    pc->reserved_disk_bytes -= e->file_bytes;
+                else
+                    pc->reserved_disk_bytes = 0;
+            }
+            e->state = e->node ? PREFIX_RAM_ONLY : PREFIX_FAILED;
+            changed = true;
+        }
+        if (!changed) break;
+    }
+    pthread_cond_broadcast(&pc->cv);
+}
+
+static void prefix_mark_failed_locked(struct ds4_prefix_cache *pc,
+                                      prefix_entry *root) {
+    if (!pc || !root) return;
+    root->state = PREFIX_FAILED;
+    for (size_t pass = 0; pass <= pc->len; pass++) {
+        bool changed = false;
+        for (size_t i = 0; i < pc->len; i++) {
+            prefix_entry *e = pc->entry[i];
+            if (e->state == PREFIX_FAILED || !e->parent_id[0]) continue;
+            prefix_entry *parent = prefix_find_id_locked(pc, e->parent_id);
+            if (!parent || parent->state != PREFIX_FAILED) continue;
+            if (e->state == PREFIX_WRITE_QUEUED) {
+                if (pc->reserved_disk_bytes >= e->file_bytes)
+                    pc->reserved_disk_bytes -= e->file_bytes;
+                else
+                    pc->reserved_disk_bytes = 0;
+            }
+            e->state = PREFIX_FAILED;
+            changed = true;
+        }
+        if (!changed) break;
+    }
+    pthread_cond_broadcast(&pc->cv);
+}
+
+static void prefix_fill_file_header(uint8_t h[PREFIX_FILE_HEADER],
+                                    const prefix_entry *e) {
+    memset(h, 0, PREFIX_FILE_HEADER);
+    memcpy(h, "PFX1", 4);
+    ds4_kvstore_le_put32(h + 4, PREFIX_FILE_VERSION);
+    prefix_put64(h + 8, e->compat_id);
+    ds4_kvstore_le_put32(h + 16, e->parent_tokens);
+    ds4_kvstore_le_put32(h + 20, e->total_tokens);
+    ds4_kvstore_le_put32(h + 24, (uint32_t)e->text_len);
+    prefix_put64(h + 28, e->node_bytes);
+    prefix_put64(h + 36, e->last_used);
+    memcpy(h + 44, e->parent_id, 40);
+    memcpy(h + 84, e->prefix_sha, 40);
+    memcpy(h + 124, e->node_id, 40);
+    prefix_put64(h + 164, e->token_hash);
+}
+
+static bool prefix_parse_file_header(const uint8_t h[PREFIX_FILE_HEADER],
+                                     prefix_entry *e) {
+    if (memcmp(h, "PFX1", 4) ||
+        ds4_kvstore_le_get32(h + 4) != PREFIX_FILE_VERSION)
+        return false;
+    e->compat_id = prefix_get64(h + 8);
+    e->parent_tokens = ds4_kvstore_le_get32(h + 16);
+    e->total_tokens = ds4_kvstore_le_get32(h + 20);
+    e->text_len = ds4_kvstore_le_get32(h + 24);
+    e->node_bytes = prefix_get64(h + 28);
+    e->last_used = prefix_get64(h + 36);
+    memcpy(e->parent_id, h + 44, 40);
+    memcpy(e->prefix_sha, h + 84, 40);
+    memcpy(e->node_id, h + 124, 40);
+    e->token_hash = prefix_get64(h + 164);
+    e->parent_id[40] = '\0';
+    e->prefix_sha[40] = '\0';
+    e->node_id[40] = '\0';
+    if (e->compat_id == 0 || e->token_hash == 0 || e->total_tokens == 0 ||
+        e->parent_tokens >= e->total_tokens ||
+        e->text_len > UINT32_MAX || e->node_bytes == 0 ||
+        e->node_bytes > SIZE_MAX)
+        return false;
+    e->file_bytes = PREFIX_FILE_HEADER + e->text_len + e->node_bytes;
+    return e->file_bytes >= e->node_bytes;
+}
+
+static bool prefix_write_entry_file(prefix_entry *e) {
+    if (!e || !e->path || !e->node) return false;
+    kv_buf tmpb = {0};
+    kv_buf_printf(&tmpb, "%s.tmp.%ld", e->path, (long)getpid());
+    char *tmp = kv_buf_take(&tmpb);
+    FILE *fp = fopen(tmp, "wb");
+    if (!fp) {
+        free(tmp);
+        return false;
+    }
+    uint8_t h[PREFIX_FILE_HEADER];
+    prefix_fill_file_header(h, e);
+    bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
+              fwrite(e->text, 1, e->text_len, fp) == e->text_len;
+    char err[160] = {0};
+    if (ok)
+        ok = ds4_prefix_node_write(e->node, fp, err, sizeof(err)) == 0;
+    if (ok) ok = fflush(fp) == 0 && fsync(fileno(fp)) == 0;
+    if (fclose(fp) != 0) ok = false;
+    if (ok) ok = rename(tmp, e->path) == 0;
+    if (!ok) unlink(tmp);
+    free(tmp);
+    return ok;
+}
+
+static prefix_entry *prefix_writer_ready_locked(struct ds4_prefix_cache *pc) {
+    for (size_t i = 0; i < pc->len; i++) {
+        prefix_entry *e = pc->entry[i];
+        if (e->state != PREFIX_WRITE_QUEUED) continue;
+        if (!e->parent_id[0]) return e;
+        prefix_entry *parent = prefix_find_id_locked(pc, e->parent_id);
+        if (!parent || parent->state == PREFIX_FAILED ||
+            parent->state == PREFIX_RAM_ONLY) {
+            prefix_cancel_writes_locked(pc, e);
+            continue;
+        }
+        if (parent->state == PREFIX_DURABLE) return e;
+    }
+    return NULL;
+}
+
+static bool prefix_disk_over_budget(struct ds4_prefix_cache *pc) {
+    if (!pc || !pc->owner || pc->owner->budget_bytes == 0) return false;
+    pthread_mutex_lock(&pc->mu);
+    const uint64_t disk_bytes = pc->disk_bytes;
+    const uint64_t reserved_disk_bytes = pc->reserved_disk_bytes;
+    const uint64_t reserved_kvc_bytes = pc->reserved_kvc_bytes;
+    pthread_mutex_unlock(&pc->mu);
+    uint64_t total = prefix_kvc_bytes(pc->owner);
+    if (UINT64_MAX - total < disk_bytes) return true;
+    total += disk_bytes;
+    if (UINT64_MAX - total < reserved_disk_bytes) return true;
+    total += reserved_disk_bytes;
+    if (UINT64_MAX - total < reserved_kvc_bytes) return true;
+    total += reserved_kvc_bytes;
+    return total > pc->owner->budget_bytes;
+}
+
+static bool prefix_gc_disk_one(struct ds4_prefix_cache *pc) {
+    pthread_mutex_lock(&pc->mu);
+    prefix_entry *victim = NULL;
+    for (size_t i = 0; i < pc->len; i++) {
+        prefix_entry *e = pc->entry[i];
+        if ((e->state != PREFIX_DURABLE && e->state != PREFIX_FAILED) ||
+            !e->path || e->pin_count != 0 ||
+            e->child_count != 0)
+            continue;
+        if (prefix_victim_before(e, victim)) victim = e;
+    }
+    if (!victim) {
+        pthread_mutex_unlock(&pc->mu);
+        return false;
+    }
+    const bool failed = victim->state == PREFIX_FAILED;
+    victim->state = PREFIX_WRITING;
+    char *path = kv_xstrdup(victim->path);
+    pthread_mutex_unlock(&pc->mu);
+
+    const bool ok = unlink(path) == 0 || errno == ENOENT;
+    free(path);
+    pthread_mutex_lock(&pc->mu);
+    if (ok) {
+        if (pc->disk_bytes >= victim->file_bytes)
+            pc->disk_bytes -= victim->file_bytes;
+        else
+            pc->disk_bytes = 0;
+        if (failed) {
+            size_t idx = prefix_index_locked(pc, victim);
+            if (idx != SIZE_MAX) {
+                victim->state = PREFIX_RAM_ONLY;
+                prefix_remove_index_locked(pc, idx);
+            }
+        } else if (victim->node) {
+            victim->state = PREFIX_RAM_ONLY;
+        } else {
+            size_t idx = prefix_index_locked(pc, victim);
+            if (idx != SIZE_MAX) {
+                /* file bytes were already removed from accounting */
+                victim->state = PREFIX_RAM_ONLY;
+                prefix_remove_index_locked(pc, idx);
+            }
+        }
+    } else {
+        victim->state = failed ? PREFIX_FAILED : PREFIX_DURABLE;
+    }
+    pthread_mutex_unlock(&pc->mu);
+    return ok;
+}
+
+static bool prefix_cancel_newest_queued_leaf(struct ds4_prefix_cache *pc,
+                                             const prefix_entry *writing) {
+    pthread_mutex_lock(&pc->mu);
+    prefix_entry *victim = NULL;
+    for (size_t i = 0; i < pc->len; i++) {
+        prefix_entry *e = pc->entry[i];
+        if (e == writing || e->state != PREFIX_WRITE_QUEUED ||
+            e->child_count != 0)
+            continue;
+        if (!victim || e->last_used > victim->last_used ||
+            (e->last_used == victim->last_used &&
+             e->total_tokens > victim->total_tokens))
+            victim = e;
+    }
+    if (victim) prefix_cancel_writes_locked(pc, victim);
+    pthread_mutex_unlock(&pc->mu);
+    return victim != NULL;
+}
+
+static void *prefix_writer_main(void *arg) {
+    struct ds4_prefix_cache *pc = arg;
+    for (;;) {
+        pthread_mutex_lock(&pc->mu);
+        prefix_entry *e = NULL;
+        while (!pc->stopping && !(e = prefix_writer_ready_locked(pc))) {
+            pthread_cond_wait(&pc->cv, &pc->mu);
+        }
+        if (pc->stopping) {
+            pthread_mutex_unlock(&pc->mu);
+            break;
+        }
+        e->state = PREFIX_WRITING;
+        e->pin_count++;
+        pc->writer_busy = true;
+        pthread_mutex_unlock(&pc->mu);
+
+        bool fits = !pc->owner->budget_bytes ||
+                    e->file_bytes <= pc->owner->budget_bytes;
+        while (fits && prefix_disk_over_budget(pc)) {
+            if (prefix_gc_disk_one(pc)) continue;
+            if (prefix_cancel_newest_queued_leaf(pc, e)) continue;
+            fits = false;
+        }
+        const bool ok = fits && prefix_write_entry_file(e);
+
+        pthread_mutex_lock(&pc->mu);
+        e->pin_count--;
+        pc->writer_busy = false;
+        if (pc->reserved_disk_bytes >= e->file_bytes)
+            pc->reserved_disk_bytes -= e->file_bytes;
+        else
+            pc->reserved_disk_bytes = 0;
+        if (ok) {
+            e->state = PREFIX_DURABLE;
+            pc->disk_bytes += e->file_bytes;
+        } else {
+            prefix_cancel_writes_locked(pc, e);
+        }
+        prefix_trim_ram_locked(pc);
+        pthread_cond_broadcast(&pc->cv);
+        pthread_mutex_unlock(&pc->mu);
+
+    }
+    return NULL;
+}
+
+static bool prefix_filename_id(const char *name, char id[41]) {
+    if (!name || strlen(name) != 44 || strcmp(name + 40, ".ptn")) return false;
+    for (int i = 0; i < 40; i++) {
+        if (!isxdigit((unsigned char)name[i])) return false;
+        id[i] = (char)tolower((unsigned char)name[i]);
+    }
+    id[40] = '\0';
+    return true;
+}
+
+static void prefix_scan_disk(struct ds4_prefix_cache *pc) {
+    DIR *dir = opendir(pc->dir);
+    if (!dir) return;
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        const size_t name_len = strlen(de->d_name);
+        if (name_len > 49 && !memcmp(de->d_name + 40, ".ptn.tmp.", 9)) {
+            char base[46];
+            memcpy(base, de->d_name, 45);
+            base[45] = '\0';
+            char stale_id[41];
+            if (prefix_filename_id(base, stale_id)) {
+                char *stale = ds4_kvstore_path_join(pc->dir, de->d_name);
+                unlink(stale);
+                free(stale);
+            }
+            continue;
+        }
+        char file_id[41];
+        if (!prefix_filename_id(de->d_name, file_id)) continue;
+        char *path = ds4_kvstore_path_join(pc->dir, de->d_name);
+        FILE *fp = fopen(path, "rb");
+        if (!fp) {
+            free(path);
+            continue;
+        }
+        uint8_t h[PREFIX_FILE_HEADER];
+        prefix_entry *e = prefix_entry_new();
+        bool ok = fread(h, 1, sizeof(h), fp) == sizeof(h) &&
+                  prefix_parse_file_header(h, e) &&
+                  !strcmp(file_id, e->node_id) &&
+                  e->compat_id == ds4_engine_prefix_compat_id(pc->engine);
+        struct stat st;
+        if (ok) ok = fstat(fileno(fp), &st) == 0 &&
+                     st.st_size >= 0 &&
+                     (uint64_t)st.st_size == e->file_bytes;
+        if (ok) {
+            e->text = kv_xmalloc(e->text_len + 1u);
+            ok = fread(e->text, 1, e->text_len, fp) == e->text_len;
+            e->text[e->text_len] = '\0';
+            char sha[41];
+            if (ok) {
+                ds4_kvstore_sha1_bytes_hex(e->text, e->text_len, sha);
+                ok = !strcmp(sha, e->prefix_sha);
+            }
+        }
+        fclose(fp);
+        if (!ok || prefix_find_id_locked(pc, e->node_id)) {
+            if (!ok) unlink(path);
+            prefix_entry_free(e);
+            free(path);
+            continue;
+        }
+        e->path = path;
+        e->state = PREFIX_DURABLE;
+        pc->disk_bytes += e->file_bytes;
+        if (e->last_used > pc->clock) pc->clock = e->last_used;
+        prefix_add_locked(pc, e);
+    }
+    closedir(dir);
+
+    bool removed;
+    do {
+        removed = false;
+        for (size_t i = 0; i < pc->len;) {
+            prefix_entry *e = pc->entry[i];
+            if (e->parent_id[0] && !prefix_find_id_locked(pc, e->parent_id)) {
+                unlink(e->path);
+                prefix_remove_index_locked(pc, i);
+                removed = true;
+                continue;
+            }
+            i++;
+        }
+    } while (removed);
+    for (size_t i = 0; i < pc->len; i++) {
+        prefix_entry *parent =
+            prefix_find_id_locked(pc, pc->entry[i]->parent_id);
+        if (parent) parent->child_count++;
+    }
+}
+
+bool ds4_kvstore_prefix_enable(ds4_kvstore *kc, ds4_engine *engine,
+                               uint64_t memory_mb,
+                               pthread_mutex_t *inference_mu) {
+    if (!kc || !engine || memory_mb == 0 ||
+        memory_mb > UINT64_MAX / (1024ull * 1024ull))
+        return false;
+    if (kc->prefix) return true;
+    struct ds4_prefix_cache *pc = kv_xmalloc(sizeof(*pc));
+    memset(pc, 0, sizeof(*pc));
+    pc->owner = kc;
+    pc->engine = engine;
+    pc->inference_mu = inference_mu;
+    pc->ram_budget = memory_mb * 1024ull * 1024ull;
+    pthread_mutex_init(&pc->mu, NULL);
+    pthread_cond_init(&pc->cv, NULL);
+    kc->prefix = pc;
+
+    if (kc->dir && kc->budget_bytes) {
+        pc->dir = ds4_kvstore_path_join(kc->dir, "tree-v1");
+        if (kv_mkdir_p(pc->dir)) {
+            prefix_scan_disk(pc);
+            if (pthread_create(&pc->writer, NULL,
+                               prefix_writer_main, pc) == 0) {
+                pc->writer_started = true;
+            }
+        }
+    }
+    kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+            "%s: immutable prefix tree enabled RAM=%llu MiB persistence=%s",
+            kv_log_name(kc),
+            (unsigned long long)memory_mb,
+            pc->writer_started ? pc->dir : "off");
+    return true;
+}
+
+bool ds4_kvstore_prefix_enabled(const ds4_kvstore *kc) {
+    return kc && kc->prefix && kc->prefix->ram_budget != 0;
+}
+
+static void prefix_cache_destroy(ds4_kvstore *kc) {
+    if (!kc || !kc->prefix) return;
+    struct ds4_prefix_cache *pc = kc->prefix;
+    if (pc->writer_started) ds4_kvstore_prefix_wait_idle(kc);
+    pthread_mutex_lock(&pc->mu);
+    pc->stopping = true;
+    pthread_cond_broadcast(&pc->cv);
+    pthread_mutex_unlock(&pc->mu);
+    if (pc->writer_started) pthread_join(pc->writer, NULL);
+    for (size_t i = 0; i < pc->len; i++) prefix_entry_free(pc->entry[i]);
+    free(pc->entry);
+    free(pc->dir);
+    pthread_cond_destroy(&pc->cv);
+    pthread_mutex_destroy(&pc->mu);
+    free(pc);
+    kc->prefix = NULL;
+}
+
+static int prefix_parent_compare(const void *ap, const void *bp) {
+    const prefix_entry *a = *(prefix_entry *const *)ap;
+    const prefix_entry *b = *(prefix_entry *const *)bp;
+    if (a->text_len != b->text_len) return a->text_len < b->text_len ? 1 : -1;
+    if (a->total_tokens != b->total_tokens)
+        return a->total_tokens < b->total_tokens ? 1 : -1;
+    return strcmp(a->node_id, b->node_id);
+}
+
+bool ds4_kvstore_prefix_capture(ds4_kvstore *kc, ds4_engine *engine,
+                                ds4_session *session, const char *cache_text,
+                                char *err, size_t errlen) {
+    if (!ds4_kvstore_prefix_enabled(kc) || !engine || !session) return false;
+    struct ds4_prefix_cache *pc = kc->prefix;
+    const ds4_tokens *live = ds4_session_tokens(session);
+    if (!live || live->len <= 0) return false;
+    size_t text_len = 0;
+    char *text = cache_text ? kv_xstrdup(cache_text) :
+        ds4_kvstore_render_tokens_text(engine, live, &text_len);
+    if (cache_text) text_len = strlen(cache_text);
+    if (text_len == 0 || text_len > UINT32_MAX) {
+        free(text);
+        return false;
+    }
+
+    pthread_mutex_lock(&pc->mu);
+    prefix_entry **parents =
+        kv_xmalloc((pc->len ? pc->len : 1u) * sizeof(parents[0]));
+    size_t parent_count = 0;
+    for (size_t i = 0; i < pc->len; i++) {
+        prefix_entry *e = pc->entry[i];
+        if (!e->node || e->state == PREFIX_FAILED ||
+            e->compat_id != ds4_engine_prefix_compat_id(engine) ||
+            e->total_tokens >= (uint32_t)live->len ||
+            e->text_len >= text_len ||
+            !ds4_kvstore_byte_prefix_match(text, text_len,
+                                           e->text, e->text_len))
+            continue;
+        e->pin_count++;
+        parents[parent_count++] = e;
+    }
+    const uint64_t capture_reservation = ds4_session_payload_bytes(session);
+    bool capture_reserved = false;
+    bool room = capture_reservation <= pc->ram_budget &&
+        UINT64_MAX - pc->reserved_ram_bytes >= capture_reservation;
+    if (room) {
+        pc->reserved_ram_bytes += capture_reservation;
+        capture_reserved = true;
+        prefix_trim_ram_locked(pc);
+        room = pc->reserved_ram_bytes <= pc->ram_budget &&
+               pc->ram_bytes <= pc->ram_budget - pc->reserved_ram_bytes;
+    }
+    if (!room) {
+        if (capture_reserved &&
+            pc->reserved_ram_bytes >= capture_reservation)
+            pc->reserved_ram_bytes -= capture_reservation;
+        for (size_t i = 0; i < parent_count; i++) parents[i]->pin_count--;
+        pthread_mutex_unlock(&pc->mu);
+        free(parents);
+        free(text);
+        if (err && errlen)
+            snprintf(err, errlen,
+                     "prefix capture exceeds the configured RAM budget");
+        return false;
+    }
+    pthread_mutex_unlock(&pc->mu);
+    qsort(parents, parent_count, sizeof(parents[0]), prefix_parent_compare);
+
+    ds4_prefix_node *node = NULL;
+    prefix_entry *chosen_parent = NULL;
+    for (size_t i = 0; i < parent_count; i++) {
+        if (ds4_session_prefix_node_capture(
+                    session, parents[i]->node, &node, err, errlen) == 0) {
+            chosen_parent = parents[i];
+            break;
+        }
+    }
+    if (!node && ds4_session_prefix_node_capture(
+                     session, NULL, &node, err, errlen) != 0) {
+        pthread_mutex_lock(&pc->mu);
+        if (pc->reserved_ram_bytes >= capture_reservation)
+            pc->reserved_ram_bytes -= capture_reservation;
+        else
+            pc->reserved_ram_bytes = 0;
+        for (size_t i = 0; i < parent_count; i++) parents[i]->pin_count--;
+        prefix_trim_ram_locked(pc);
+        pthread_mutex_unlock(&pc->mu);
+        free(parents);
+        free(text);
+        return false;
+    }
+
+    char node_id[41];
+    prefix_node_id(chosen_parent ? chosen_parent->node_id : NULL,
+                   node, node_id);
+    char prefix_sha[41];
+    ds4_kvstore_sha1_bytes_hex(text, text_len, prefix_sha);
+
+    pthread_mutex_lock(&pc->mu);
+    if (pc->reserved_ram_bytes >= capture_reservation)
+        pc->reserved_ram_bytes -= capture_reservation;
+    else
+        pc->reserved_ram_bytes = 0;
+    prefix_entry *existing = prefix_find_id_locked(pc, node_id);
+    if (existing) {
+        existing->last_used = ++pc->clock;
+        for (size_t i = 0; i < parent_count; i++) parents[i]->pin_count--;
+        pthread_mutex_unlock(&pc->mu);
+        ds4_prefix_node_free(node);
+        free(parents);
+        free(text);
+        return true;
+    }
+
+    prefix_entry *e = prefix_entry_new();
+    memcpy(e->node_id, node_id, sizeof(e->node_id));
+    memcpy(e->prefix_sha, prefix_sha, sizeof(e->prefix_sha));
+    if (chosen_parent)
+        memcpy(e->parent_id, chosen_parent->node_id, sizeof(e->parent_id));
+    e->text = text;
+    e->text_len = text_len;
+    e->node = node;
+    e->compat_id = ds4_prefix_node_compat_id(node);
+    e->token_hash = ds4_prefix_node_token_hash(node);
+    e->node_bytes = ds4_prefix_node_bytes(node);
+    e->file_bytes = PREFIX_FILE_HEADER + text_len + e->node_bytes;
+    e->parent_tokens = ds4_prefix_node_parent_tokens(node);
+    e->total_tokens = ds4_prefix_node_total_tokens(node);
+    e->last_used = ++pc->clock;
+    if (pc->writer_started) {
+        kv_buf name = {0};
+        kv_buf_printf(&name, "%s.ptn", e->node_id);
+        e->path = ds4_kvstore_path_join(pc->dir, name.ptr);
+        free(name.ptr);
+        e->state = PREFIX_WRITE_QUEUED;
+        pc->reserved_disk_bytes += e->file_bytes;
+    } else {
+        e->state = PREFIX_RAM_ONLY;
+    }
+    prefix_add_locked(pc, e);
+    pc->ram_bytes += e->node_bytes;
+    if (chosen_parent) chosen_parent->child_count++;
+    for (size_t i = 0; i < parent_count; i++) parents[i]->pin_count--;
+    prefix_trim_ram_locked(pc);
+    prefix_entry *admitted_entry = prefix_find_id_locked(pc, node_id);
+    if (pc->ram_bytes > pc->ram_budget && admitted_entry &&
+        admitted_entry->child_count == 0 && admitted_entry->pin_count == 0) {
+        const size_t idx = prefix_index_locked(pc, admitted_entry);
+        if (idx != SIZE_MAX) prefix_remove_index_locked(pc, idx);
+        admitted_entry = NULL;
+    }
+    const bool admitted = admitted_entry != NULL &&
+                          pc->ram_bytes <= pc->ram_budget;
+    pthread_cond_broadcast(&pc->cv);
+    pthread_mutex_unlock(&pc->mu);
+    free(parents);
+    if (!admitted) {
+        if (err && errlen)
+            snprintf(err, errlen,
+                     "prefix node exceeds the configured RAM budget");
+        return false;
+    }
+    return true;
+}
+
+static prefix_entry *prefix_best_locked(struct ds4_prefix_cache *pc,
+                                        const char *prompt, size_t prompt_len,
+                                        const ds4_tokens *prompt_tokens,
+                                        const uint64_t *prompt_hashes) {
+    prefix_entry *best = NULL;
+    const uint64_t compat = ds4_engine_prefix_compat_id(pc->engine);
+    for (size_t i = 0; i < pc->len; i++) {
+        prefix_entry *e = pc->entry[i];
+        if (e->state == PREFIX_FAILED || e->compat_id != compat ||
+            e->text_len > prompt_len ||
+            (prompt_tokens &&
+             (e->total_tokens > (uint32_t)prompt_tokens->len ||
+              !prompt_hashes ||
+              e->token_hash != prompt_hashes[e->total_tokens])) ||
+            !ds4_kvstore_byte_prefix_match(prompt, prompt_len,
+                                           e->text, e->text_len))
+            continue;
+        if (!best || e->text_len > best->text_len ||
+            (e->text_len == best->text_len &&
+             e->total_tokens > best->total_tokens) ||
+            (e->text_len == best->text_len &&
+             e->total_tokens == best->total_tokens &&
+             e->node && !best->node))
+            best = e;
+    }
+    return best;
+}
+
+bool ds4_kvstore_prefix_find(ds4_kvstore *kc, const char *prompt_text,
+                             const ds4_tokens *prompt_tokens,
+                             ds4_prefix_lookup *out) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!ds4_kvstore_prefix_enabled(kc) || !prompt_text) return false;
+    struct ds4_prefix_cache *pc = kc->prefix;
+    uint64_t *prompt_hashes =
+        prefix_prompt_token_hashes(prompt_tokens);
+    pthread_mutex_lock(&pc->mu);
+    prefix_entry *e = prefix_best_locked(pc, prompt_text, strlen(prompt_text),
+                                         prompt_tokens, prompt_hashes);
+    if (e && out) {
+        out->tokens = (int)e->total_tokens;
+        out->text_bytes = e->text_len;
+        out->ram_resident = e->node != NULL;
+        for (prefix_entry *p = e; p;
+             p = prefix_find_id_locked(pc, p->parent_id)) {
+            if (!p->node) {
+                if (UINT64_MAX - out->restore_bytes < p->node_bytes) {
+                    out->restore_bytes = UINT64_MAX;
+                    break;
+                }
+                out->restore_bytes += p->node_bytes;
+            }
+            if (!p->parent_id[0]) break;
+        }
+    }
+    pthread_mutex_unlock(&pc->mu);
+    free(prompt_hashes);
+    return e != NULL;
+}
+
+static bool prefix_load_node_file(prefix_entry *e, ds4_engine *engine,
+                                  ds4_prefix_node **out,
+                                  char *err, size_t errlen) {
+    *out = NULL;
+    FILE *fp = fopen(e->path, "rb");
+    if (!fp) return false;
+    bool ok = fseeko(fp, (off_t)(PREFIX_FILE_HEADER + e->text_len),
+                     SEEK_SET) == 0 &&
+              ds4_prefix_node_read(engine, fp, e->node_bytes,
+                                   out, err, errlen) == 0;
+    fclose(fp);
+    if (ok) {
+        char sha[41];
+        prefix_node_id(e->parent_id, *out, sha);
+        ok = !strcmp(sha, e->node_id);
+    }
+    if (!ok) {
+        ds4_prefix_node_free(*out);
+        *out = NULL;
+    }
+    return ok;
+}
+
+int ds4_kvstore_prefix_restore(ds4_kvstore *kc, ds4_engine *engine,
+                               ds4_session *session, const char *prompt_text,
+                               const ds4_tokens *prompt_tokens,
+                               ds4_tokens *effective_prompt,
+                               ds4_prefix_lookup *out,
+                               char *err, size_t errlen) {
+    if (out) memset(out, 0, sizeof(*out));
+    if (!ds4_kvstore_prefix_enabled(kc) || !engine || !session ||
+        !prompt_text)
+        return 0;
+    struct ds4_prefix_cache *pc = kc->prefix;
+    uint64_t *prompt_hashes =
+        prefix_prompt_token_hashes(prompt_tokens);
+    pthread_mutex_lock(&pc->mu);
+    prefix_entry *selected =
+        prefix_best_locked(pc, prompt_text, strlen(prompt_text),
+                           prompt_tokens, prompt_hashes);
+    free(prompt_hashes);
+    if (!selected) {
+        pthread_mutex_unlock(&pc->mu);
+        return 0;
+    }
+    const uint32_t selected_tokens = selected->total_tokens;
+    const size_t selected_text_len = selected->text_len;
+    prefix_entry **reverse =
+        kv_xmalloc((pc->len ? pc->len : 1u) * sizeof(reverse[0]));
+    size_t count = 0;
+    for (prefix_entry *e = selected; e; e = prefix_find_id_locked(pc, e->parent_id)) {
+        if (count >= pc->len || e->state == PREFIX_FAILED) break;
+        e->pin_count++;
+        reverse[count++] = e;
+        if (!e->parent_id[0]) break;
+    }
+    if (count == 0 || reverse[count - 1u]->parent_id[0]) {
+        for (size_t i = 0; i < count; i++) reverse[i]->pin_count--;
+        pthread_mutex_unlock(&pc->mu);
+        free(reverse);
+        return 0;
+    }
+    prefix_entry **path = kv_xmalloc(count * sizeof(path[0]));
+    for (size_t i = 0; i < count; i++) path[i] = reverse[count - i - 1u];
+    uint64_t missing_bytes = 0;
+    bool room = true;
+    bool reserved = false;
+    for (size_t i = 0; i < count; i++) {
+        if (path[i]->node) continue;
+        if (UINT64_MAX - missing_bytes < path[i]->node_bytes) {
+            room = false;
+            break;
+        }
+        missing_bytes += path[i]->node_bytes;
+    }
+    if (room && UINT64_MAX - pc->reserved_ram_bytes >= missing_bytes) {
+        pc->reserved_ram_bytes += missing_bytes;
+        reserved = true;
+    } else {
+        room = false;
+    }
+    if (room) {
+        prefix_trim_ram_locked(pc);
+        room = pc->reserved_ram_bytes <= pc->ram_budget &&
+               pc->ram_bytes <= pc->ram_budget - pc->reserved_ram_bytes;
+    }
+    if (!room) {
+        if (reserved && pc->reserved_ram_bytes >= missing_bytes)
+            pc->reserved_ram_bytes -= missing_bytes;
+        for (size_t i = 0; i < count; i++) path[i]->pin_count--;
+        pthread_mutex_unlock(&pc->mu);
+        free(path);
+        free(reverse);
+        if (err && errlen)
+            snprintf(err, errlen,
+                     "prefix restore chain exceeds the configured RAM budget");
+        return 0;
+    }
+    pthread_mutex_unlock(&pc->mu);
+    free(reverse);
+
+    ds4_prefix_node **nodes = kv_xmalloc(count * sizeof(nodes[0]));
+    bool *owned = kv_xmalloc(count * sizeof(owned[0]));
+    memset(nodes, 0, count * sizeof(nodes[0]));
+    memset(owned, 0, count * sizeof(owned[0]));
+    bool ok = true;
+    size_t failed_at = SIZE_MAX;
+    for (size_t i = 0; ok && i < count; i++) {
+        if (path[i]->node) {
+            nodes[i] = path[i]->node;
+        } else {
+            ok = prefix_load_node_file(path[i], engine, &nodes[i],
+                                       err, errlen);
+            owned[i] = ok;
+            if (!ok) failed_at = i;
+        }
+    }
+    const double t0 = kv_now_sec();
+    const bool inference_locked = ok && pc->inference_mu;
+    if (inference_locked)
+        pthread_mutex_lock(pc->inference_mu);
+    if (ok)
+        ok = ds4_session_prefix_chain_restore(
+                    session, (const ds4_prefix_node *const *)nodes,
+                    count, err, errlen) == 0;
+    bool prompt_mismatch = false;
+    if (ok && prompt_tokens) {
+        const ds4_tokens *tokens = ds4_session_tokens(session);
+        prompt_mismatch = !tokens || tokens->len != (int)selected_tokens ||
+            prompt_tokens->len < (int)selected_tokens ||
+            memcmp(tokens->v, prompt_tokens->v,
+                   (size_t)selected_tokens * sizeof(tokens->v[0])) != 0;
+        if (prompt_mismatch) {
+            ds4_session_invalidate(session);
+            if (err && errlen)
+                snprintf(err, errlen,
+                         "prefix tokenization does not match this prompt");
+            ok = false;
+        }
+    }
+    if (ok && effective_prompt && prompt_tokens) {
+        ds4_tokens_copy(effective_prompt, prompt_tokens);
+    } else if (ok && effective_prompt) {
+        const ds4_tokens *tokens = ds4_session_tokens(session);
+        ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+                engine, tokens, prompt_text + selected_text_len,
+                effective_prompt);
+    }
+    if (inference_locked)
+        pthread_mutex_unlock(pc->inference_mu);
+
+    pthread_mutex_lock(&pc->mu);
+    if (pc->reserved_ram_bytes >= missing_bytes)
+        pc->reserved_ram_bytes -= missing_bytes;
+    else
+        pc->reserved_ram_bytes = 0;
+    if (ok) {
+        const uint64_t used = ++pc->clock;
+        for (size_t i = 0; i < count; i++) {
+            path[i]->last_used = used;
+            if (owned[i] && !path[i]->node) {
+                path[i]->node = nodes[i];
+                pc->ram_bytes += path[i]->node_bytes;
+                owned[i] = false;
+            }
+        }
+    } else if (!prompt_mismatch) {
+        prefix_mark_failed_locked(
+            pc, failed_at == SIZE_MAX ? selected : path[failed_at]);
+    }
+    for (size_t i = 0; i < count; i++) path[i]->pin_count--;
+    prefix_trim_ram_locked(pc);
+    if (ok && out) {
+        out->tokens = (int)selected->total_tokens;
+        out->text_bytes = selected_text_len;
+        out->ram_resident = selected->node != NULL;
+    }
+    pthread_cond_broadcast(&pc->cv);
+    pthread_mutex_unlock(&pc->mu);
+
+    for (size_t i = 0; i < count; i++) {
+        if (owned[i]) ds4_prefix_node_free(nodes[i]);
+    }
+    free(owned);
+    free(nodes);
+    free(path);
+    if (!ok) return 0;
+    kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+            "%s: prefix tree hit tokens=%u text=%zu load=%.1f ms",
+            kv_log_name(kc), selected_tokens, selected_text_len,
+            (kv_now_sec() - t0) * 1000.0);
+    return (int)selected_tokens;
+}
+
+void ds4_kvstore_prefix_wait_idle(ds4_kvstore *kc) {
+    if (!kc || !kc->prefix) return;
+    struct ds4_prefix_cache *pc = kc->prefix;
+    pthread_mutex_lock(&pc->mu);
+    for (;;) {
+        bool pending = pc->writer_busy;
+        for (size_t i = 0; !pending && i < pc->len; i++) {
+            pending = pc->entry[i]->state == PREFIX_WRITE_QUEUED ||
+                      pc->entry[i]->state == PREFIX_WRITING;
+        }
+        if (!pending) break;
+        pthread_cond_wait(&pc->cv, &pc->mu);
+    }
+    pthread_mutex_unlock(&pc->mu);
+}
+
+void ds4_kvstore_prefix_stats(ds4_kvstore *kc, ds4_prefix_stats *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!kc || !kc->prefix) return;
+    struct ds4_prefix_cache *pc = kc->prefix;
+    pthread_mutex_lock(&pc->mu);
+    out->nodes = pc->len;
+    out->ram_bytes = pc->ram_bytes;
+    out->disk_bytes = pc->disk_bytes;
+    for (size_t i = 0; i < pc->len; i++) {
+        prefix_entry *e = pc->entry[i];
+        if (e->node) out->ram_nodes++;
+        if (e->state == PREFIX_DURABLE) out->durable_nodes++;
+        if (e->state == PREFIX_WRITE_QUEUED ||
+            e->state == PREFIX_WRITING)
+            out->pending_nodes++;
+    }
+    pthread_mutex_unlock(&pc->mu);
 }

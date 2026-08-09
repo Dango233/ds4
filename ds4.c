@@ -35938,6 +35938,7 @@ struct ds4_engine {
     uint32_t ssd_streaming_full_layers;
     uint32_t ssd_streaming_preload_experts;
     uint64_t startup_model_span_bytes;
+    uint64_t prefix_compat_id;
     ds4_ssd_memory_lock simulated_memory;
     bool quality;
     bool glm_mtp;
@@ -48705,6 +48706,85 @@ static DS4_MAYBE_UNUSED uint64_t layer_index_state_bytes(uint32_t ratio) {
     return (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM * coff * ratio * sizeof(float);
 }
 
+#define DS4_PREFIX_NODE_MAGIC UINT32_C(0x50565344) /* "DSVP" */
+#define DS4_PREFIX_NODE_VERSION UINT32_C(1)
+#define DS4_PREFIX_NODE_HEADER_U32_FIELDS 22u
+
+struct ds4_prefix_node {
+    uint8_t *ptr;
+    uint64_t len;
+    uint64_t compat_id;
+    uint64_t token_hash;
+    uint64_t payload_hash[2];
+    uint32_t ctx_size;
+    uint32_t raw_cap;
+    uint32_t raw_window;
+    uint32_t comp_cap;
+    uint32_t parent_tokens;
+    uint32_t total_tokens;
+    uint32_t raw_live;
+    uint32_t parent_n_comp[DS4_MAX_LAYER];
+    uint32_t n_comp[DS4_MAX_LAYER];
+    uint32_t parent_n_index_comp[DS4_MAX_LAYER];
+    uint32_t n_index_comp[DS4_MAX_LAYER];
+};
+
+static uint64_t prefix_hash_bytes(uint64_t h, const void *ptr, size_t len) {
+    const uint8_t *p = ptr;
+    while (len--) {
+        h ^= *p++;
+        h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
+static uint64_t prefix_hash_u64(uint64_t h, uint64_t v) {
+    uint8_t b[8];
+    for (unsigned i = 0; i < 8; i++) b[i] = (uint8_t)(v >> (i * 8));
+    return prefix_hash_bytes(h, b, sizeof(b));
+}
+
+static uint64_t prefix_token_hash(const int *tokens, uint32_t count) {
+    uint64_t h = UINT64_C(1469598103934665603);
+    for (uint32_t i = 0; i < count; i++) {
+        h = prefix_hash_u64(h, (uint32_t)tokens[i]);
+    }
+    return h;
+}
+
+static void prefix_node_payload_hash(const uint8_t *ptr, uint64_t len,
+                                     uint64_t out[2]) {
+    const uint64_t checksum_at = 18u * sizeof(uint32_t);
+    const uint64_t payload_at = 22u * sizeof(uint32_t);
+    uint64_t h0 = UINT64_C(1469598103934665603);
+    uint64_t h1 = UINT64_C(1099511628211);
+    if (!ptr || !out || len < payload_at) {
+        if (out) out[0] = out[1] = 0;
+        return;
+    }
+    const uint8_t *parts[] = {ptr, ptr + payload_at};
+    const uint64_t sizes[] = {checksum_at, len - payload_at};
+    for (size_t part = 0; part < 2; part++) {
+        const uint8_t *p = parts[part];
+        uint64_t n = sizes[part];
+        while (n >= sizeof(uint64_t)) {
+            uint64_t word;
+            memcpy(&word, p, sizeof(word));
+            h0 ^= word;
+            h0 *= UINT64_C(1099511628211);
+            h1 ^= word + UINT64_C(0x9e3779b97f4a7c15) +
+                  (h1 << 6) + (h1 >> 2);
+            h1 *= UINT64_C(0xbf58476d1ce4e5b9);
+            p += sizeof(word);
+            n -= sizeof(word);
+        }
+        h0 = prefix_hash_bytes(h0, p, (size_t)n);
+        h1 = prefix_hash_bytes(h1, p, (size_t)n);
+    }
+    out[0] = h0;
+    out[1] = h1;
+}
+
 #ifndef DS4_NO_GPU
 /* Only the last logical sliding-window rows are needed from the raw cache.
  * The physical Metal tensor is a ring sized for ubatches, but after restore
@@ -49950,6 +50030,77 @@ const ds4_tokens *ds4_session_tokens(ds4_session *s) {
     return s ? &s->checkpoint : NULL;
 }
 
+uint64_t ds4_engine_prefix_compat_id(ds4_engine *e) {
+    if (!e) return 0;
+    if (e->prefix_compat_id) return e->prefix_compat_id;
+    uint64_t h = UINT64_C(1469598103934665603);
+    const uint64_t abi[] = {
+        DS4_PREFIX_NODE_VERSION,
+        DS4_SESSION_PAYLOAD_VERSION,
+        (uint64_t)DS4_MODEL_FAMILY,
+        (uint64_t)e->backend,
+        (uint64_t)ds4_engine_routed_quant_bits(e),
+        (uint64_t)DS4_N_LAYER,
+        (uint64_t)DS4_N_HEAD_DIM,
+        (uint64_t)DS4_N_INDEXER_HEAD_DIM,
+        (uint64_t)DS4_N_VOCAB,
+        (uint64_t)e->quality,
+        (uint64_t)e->ssd_streaming,
+#ifndef DS4_NO_GPU
+        (uint64_t)DS4_GPU_ATTN_COMP_CACHE_F16,
+#else
+        0,
+#endif
+    };
+    h = prefix_hash_bytes(h, abi, sizeof(abi));
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        h = prefix_hash_u64(h, ds4_layer_compress_ratio(il));
+    }
+
+    struct stat st;
+    if (e->model.fd < 0 || fstat(e->model.fd, &st) != 0) return 0;
+    h = prefix_hash_u64(h, (uint64_t)st.st_dev);
+    h = prefix_hash_u64(h, (uint64_t)st.st_ino);
+    h = prefix_hash_u64(h, (uint64_t)st.st_size);
+    h = prefix_hash_u64(h, (uint64_t)st.st_mtime);
+#if defined(__APPLE__)
+    h = prefix_hash_u64(h, (uint64_t)st.st_mtimespec.tv_nsec);
+#elif defined(__linux__)
+    h = prefix_hash_u64(h, (uint64_t)st.st_mtim.tv_nsec);
+#endif
+    if (e->model.map && e->model.tensor_data_pos <= e->model.size)
+        h = prefix_hash_bytes(h, e->model.map,
+                              (size_t)e->model.tensor_data_pos);
+
+    uint32_t steering_bits[2] = {0};
+    memcpy(&steering_bits[0], &e->directional_steering_attn_scale,
+           sizeof(steering_bits[0]));
+    memcpy(&steering_bits[1], &e->directional_steering_ffn_scale,
+           sizeof(steering_bits[1]));
+    h = prefix_hash_bytes(h, steering_bits, sizeof(steering_bits));
+    if (e->directional_steering_file) {
+        h = prefix_hash_bytes(h, e->directional_steering_file,
+                              strlen(e->directional_steering_file));
+        if (stat(e->directional_steering_file, &st) == 0) {
+            h = prefix_hash_u64(h, (uint64_t)st.st_size);
+            h = prefix_hash_u64(h, (uint64_t)st.st_mtime);
+#if defined(__APPLE__)
+            h = prefix_hash_u64(h, (uint64_t)st.st_mtimespec.tv_nsec);
+#elif defined(__linux__)
+            h = prefix_hash_u64(h, (uint64_t)st.st_mtim.tv_nsec);
+#endif
+        }
+    }
+    if (e->directional_steering_dirs) {
+        const uint64_t n = (uint64_t)DS4_N_LAYER * DS4_N_EMBD;
+        h = prefix_hash_bytes(
+            h, e->directional_steering_dirs,
+            (size_t)n * sizeof(e->directional_steering_dirs[0]));
+    }
+    e->prefix_compat_id = h ? h : 1;
+    return e->prefix_compat_id;
+}
+
 #ifndef DS4_NO_GPU
 static void spec_frontier_free(ds4_spec_frontier *f) {
     if (!f) return;
@@ -51157,6 +51308,677 @@ void ds4_session_snapshot_free(ds4_session_snapshot *snap) {
     if (!snap) return;
     free(snap->ptr);
     memset(snap, 0, sizeof(*snap));
+}
+
+static uint32_t prefix_blob_u32(const uint8_t *p, uint64_t index) {
+    return payload_get_u32(p + index * sizeof(uint32_t));
+}
+
+static uint64_t prefix_blob_u64_pair(const uint8_t *p, uint64_t index) {
+    return (uint64_t)prefix_blob_u32(p, index) |
+           ((uint64_t)prefix_blob_u32(p, index + 1u) << 32);
+}
+
+static bool prefix_node_expected_bytes(const ds4_prefix_node *node,
+                                       uint64_t *out) {
+    if (!node || !out) return false;
+    uint64_t bytes =
+        (uint64_t)(DS4_PREFIX_NODE_HEADER_U32_FIELDS +
+                   4u * DS4_N_LAYER) * sizeof(uint32_t);
+    if (!payload_u64_add_tensor_bytes(&bytes,
+                                      node->total_tokens - node->parent_tokens,
+                                      1u) ||
+        !payload_u64_add_tensor_bytes(&bytes, DS4_N_VOCAB, 1u))
+        return false;
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (!payload_u64_add_tensor_bytes(&bytes, node->raw_live,
+                                          DS4_N_HEAD_DIM))
+            return false;
+        if (ratio == 0) continue;
+        if (!payload_u64_add_tensor_bytes(
+                    &bytes, node->n_comp[il] - node->parent_n_comp[il],
+                    DS4_N_HEAD_DIM) ||
+            !payload_u64_add(&bytes, layer_attn_state_bytes(ratio)) ||
+            !payload_u64_add(&bytes, layer_attn_state_bytes(ratio)))
+            return false;
+        if (ratio == 4) {
+            if (!payload_u64_add_tensor_bytes(
+                        &bytes,
+                        node->n_index_comp[il] -
+                            node->parent_n_index_comp[il],
+                        DS4_N_INDEXER_HEAD_DIM) ||
+                !payload_u64_add(&bytes, layer_index_state_bytes(ratio)) ||
+                !payload_u64_add(&bytes, layer_index_state_bytes(ratio)))
+                return false;
+        }
+    }
+    *out = bytes;
+    return true;
+}
+
+static int prefix_node_decode(ds4_prefix_node *node, ds4_engine *engine,
+                              char *err, size_t errlen) {
+    const uint64_t metadata_bytes =
+        (uint64_t)(DS4_PREFIX_NODE_HEADER_U32_FIELDS +
+                   4u * DS4_N_LAYER) * sizeof(uint32_t);
+    if (!node || !node->ptr || node->len < metadata_bytes) {
+        payload_set_err(err, errlen, "truncated prefix node metadata");
+        return 1;
+    }
+    const uint8_t *p = node->ptr;
+    if (prefix_blob_u32(p, 0) != DS4_PREFIX_NODE_MAGIC ||
+        prefix_blob_u32(p, 1) != DS4_PREFIX_NODE_VERSION) {
+        payload_set_err(err, errlen, "unsupported prefix node version");
+        return 1;
+    }
+    node->ctx_size = prefix_blob_u32(p, 2);
+    node->raw_cap = prefix_blob_u32(p, 3);
+    node->raw_window = prefix_blob_u32(p, 4);
+    node->comp_cap = prefix_blob_u32(p, 5);
+    node->parent_tokens = prefix_blob_u32(p, 6);
+    node->total_tokens = prefix_blob_u32(p, 7);
+    const uint32_t token_delta = prefix_blob_u32(p, 8);
+    node->raw_live = prefix_blob_u32(p, 9);
+    if (prefix_blob_u32(p, 10) != DS4_N_LAYER ||
+        prefix_blob_u32(p, 11) != DS4_N_HEAD_DIM ||
+        prefix_blob_u32(p, 12) != DS4_N_INDEXER_HEAD_DIM ||
+        prefix_blob_u32(p, 13) != DS4_N_VOCAB) {
+        payload_set_err(err, errlen,
+                        "prefix node was written for a different DS4 layout");
+        return 1;
+    }
+    node->compat_id = prefix_blob_u64_pair(p, 14);
+    node->token_hash = prefix_blob_u64_pair(p, 16);
+    node->payload_hash[0] = prefix_blob_u64_pair(p, 18);
+    node->payload_hash[1] = prefix_blob_u64_pair(p, 20);
+    uint64_t actual_hash[2];
+    prefix_node_payload_hash(node->ptr, node->len, actual_hash);
+    if (node->payload_hash[0] != actual_hash[0] ||
+        node->payload_hash[1] != actual_hash[1]) {
+        payload_set_err(err, errlen, "prefix node payload checksum mismatch");
+        return 1;
+    }
+    if (node->compat_id == 0 ||
+        (engine && node->compat_id != ds4_engine_prefix_compat_id(engine))) {
+        payload_set_err(err, errlen, "prefix node engine compatibility mismatch");
+        return 1;
+    }
+    if (node->parent_tokens >= node->total_tokens ||
+        token_delta != node->total_tokens - node->parent_tokens ||
+        node->total_tokens >= node->ctx_size ||
+        node->raw_cap == 0 || node->raw_window == 0 ||
+        node->raw_live !=
+            (node->total_tokens < node->raw_window
+                 ? node->total_tokens : node->raw_window) ||
+        node->raw_live > node->raw_cap) {
+        payload_set_err(err, errlen, "prefix node token/raw layout is invalid");
+        return 1;
+    }
+
+    uint64_t at = DS4_PREFIX_NODE_HEADER_U32_FIELDS;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++)
+        node->parent_n_comp[il] = prefix_blob_u32(p, at++);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++)
+        node->n_comp[il] = prefix_blob_u32(p, at++);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++)
+        node->parent_n_index_comp[il] = prefix_blob_u32(p, at++);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++)
+        node->n_index_comp[il] = prefix_blob_u32(p, at++);
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (node->parent_n_comp[il] > node->n_comp[il] ||
+            node->n_comp[il] > node->comp_cap ||
+            node->parent_n_index_comp[il] > node->n_index_comp[il] ||
+            node->n_index_comp[il] > node->comp_cap ||
+            (ratio == 0 &&
+             (node->parent_n_comp[il] != 0 || node->n_comp[il] != 0 ||
+              node->parent_n_index_comp[il] != 0 ||
+              node->n_index_comp[il] != 0)) ||
+            (ratio != 4 &&
+             (node->parent_n_index_comp[il] != 0 ||
+              node->n_index_comp[il] != 0))) {
+            payload_set_err(err, errlen,
+                            "prefix node compressed counters are invalid");
+            return 1;
+        }
+    }
+    uint64_t expected = 0;
+    if (!prefix_node_expected_bytes(node, &expected) || expected != node->len) {
+        payload_set_err(err, errlen, "prefix node payload length mismatch");
+        return 1;
+    }
+    return 0;
+}
+
+uint64_t ds4_prefix_node_bytes(const ds4_prefix_node *node) {
+    return node ? node->len : 0;
+}
+
+void ds4_prefix_node_digest(const ds4_prefix_node *node, uint64_t out[2]) {
+    if (!out) return;
+    out[0] = node ? node->payload_hash[0] : 0;
+    out[1] = node ? node->payload_hash[1] : 0;
+}
+
+uint64_t ds4_prefix_node_compat_id(const ds4_prefix_node *node) {
+    return node ? node->compat_id : 0;
+}
+
+uint64_t ds4_prefix_node_token_hash(const ds4_prefix_node *node) {
+    return node ? node->token_hash : 0;
+}
+
+uint32_t ds4_prefix_node_parent_tokens(const ds4_prefix_node *node) {
+    return node ? node->parent_tokens : 0;
+}
+
+uint32_t ds4_prefix_node_total_tokens(const ds4_prefix_node *node) {
+    return node ? node->total_tokens : 0;
+}
+
+void ds4_prefix_node_free(ds4_prefix_node *node) {
+    if (!node) return;
+    free(node->ptr);
+    free(node);
+}
+
+int ds4_prefix_node_write(const ds4_prefix_node *node, FILE *fp,
+                          char *err, size_t errlen) {
+    if (!node || !node->ptr || node->len == 0 || !fp) {
+        payload_set_err(err, errlen, "invalid prefix node write");
+        return 1;
+    }
+    return payload_write_bytes(fp, node->ptr, node->len, err, errlen);
+}
+
+int ds4_prefix_node_read(ds4_engine *engine, FILE *fp, uint64_t bytes,
+                         ds4_prefix_node **out, char *err, size_t errlen) {
+    if (out) *out = NULL;
+    if (!engine || !fp || !out || bytes == 0 || bytes > SIZE_MAX) {
+        payload_set_err(err, errlen, "invalid prefix node read");
+        return 1;
+    }
+    ds4_prefix_node *node = xcalloc(1, sizeof(*node));
+    node->ptr = xmalloc((size_t)bytes);
+    node->len = bytes;
+    if (fread(node->ptr, 1, (size_t)bytes, fp) != (size_t)bytes ||
+        prefix_node_decode(node, engine, err, errlen) != 0) {
+        if (ferror(fp)) payload_set_err(err, errlen,
+                                       "failed to read prefix node payload");
+        ds4_prefix_node_free(node);
+        return 1;
+    }
+    *out = node;
+    return 0;
+}
+
+int ds4_session_prefix_node_capture(ds4_session *s,
+                                    const ds4_prefix_node *parent,
+                                    ds4_prefix_node **out,
+                                    char *err, size_t errlen) {
+    if (out) *out = NULL;
+    if (!s || !out || !s->checkpoint_valid) {
+        payload_set_err(err, errlen,
+                        "session has no valid checkpoint to capture");
+        return 1;
+    }
+    if (s->distributed || ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
+        payload_set_err(err, errlen,
+                        "prefix nodes currently require local Flash GPU state");
+        return 1;
+    }
+#ifdef DS4_NO_GPU
+    (void)parent;
+    payload_set_err(err, errlen, "graph backend support is not compiled in");
+    return 1;
+#else
+    ds4_gpu_graph *g = &s->graph;
+    const uint32_t total_tokens = (uint32_t)s->checkpoint.len;
+    const uint64_t compat_id = ds4_engine_prefix_compat_id(s->engine);
+    const uint32_t parent_tokens = parent ? parent->total_tokens : 0;
+    if (compat_id == 0 || total_tokens == 0 ||
+        total_tokens >= (uint32_t)s->ctx_size ||
+        parent_tokens >= total_tokens ||
+        (parent && parent->compat_id != compat_id) ||
+        (parent &&
+         parent->token_hash !=
+             prefix_token_hash(s->checkpoint.v, parent_tokens))) {
+        payload_set_err(err, errlen,
+                        "prefix node parent is not an exact live prefix");
+        return 1;
+    }
+
+    ds4_prefix_node *node = xcalloc(1, sizeof(*node));
+    node->compat_id = compat_id;
+    node->token_hash = prefix_token_hash(s->checkpoint.v, total_tokens);
+    node->ctx_size = (uint32_t)s->ctx_size;
+    node->raw_cap = g->raw_cap;
+    node->raw_window = g->raw_window;
+    node->comp_cap = g->comp_cap;
+    node->parent_tokens = parent_tokens;
+    node->total_tokens = total_tokens;
+    node->raw_live = session_raw_live_rows(g, total_tokens);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        node->parent_n_comp[il] = parent ? parent->n_comp[il] : 0;
+        node->parent_n_index_comp[il] =
+            parent ? parent->n_index_comp[il] : 0;
+        node->n_comp[il] = g->layer_n_comp[il];
+        node->n_index_comp[il] = g->layer_n_index_comp[il];
+        if (node->parent_n_comp[il] > node->n_comp[il] ||
+            node->parent_n_index_comp[il] > node->n_index_comp[il]) {
+            ds4_prefix_node_free(node);
+            payload_set_err(err, errlen,
+                            "prefix node parent counters exceed live state");
+            return 1;
+        }
+    }
+    if (!prefix_node_expected_bytes(node, &node->len) ||
+        node->len > SIZE_MAX) {
+        ds4_prefix_node_free(node);
+        payload_set_err(err, errlen, "prefix node size overflow");
+        return 1;
+    }
+    node->ptr = xmalloc((size_t)node->len);
+    FILE *fp = fmemopen(node->ptr, (size_t)node->len, "wb");
+    if (!fp) {
+        ds4_prefix_node_free(node);
+        payload_set_err(err, errlen,
+                        "failed to open prefix node memory stream");
+        return 1;
+    }
+    if (ds4_gpu_synchronize() == 0) {
+        fclose(fp);
+        ds4_prefix_node_free(node);
+        payload_set_err(err, errlen,
+                        "failed to synchronize accelerator before prefix capture");
+        return 1;
+    }
+
+    const uint32_t header[DS4_PREFIX_NODE_HEADER_U32_FIELDS] = {
+        DS4_PREFIX_NODE_MAGIC,
+        DS4_PREFIX_NODE_VERSION,
+        node->ctx_size,
+        node->raw_cap,
+        node->raw_window,
+        node->comp_cap,
+        node->parent_tokens,
+        node->total_tokens,
+        node->total_tokens - node->parent_tokens,
+        node->raw_live,
+        DS4_N_LAYER,
+        DS4_N_HEAD_DIM,
+        DS4_N_INDEXER_HEAD_DIM,
+        DS4_N_VOCAB,
+        (uint32_t)node->compat_id,
+        (uint32_t)(node->compat_id >> 32),
+        (uint32_t)node->token_hash,
+        (uint32_t)(node->token_hash >> 32),
+        0,
+        0,
+        0,
+        0,
+    };
+    int rc = 0;
+    for (uint32_t i = 0; rc == 0 &&
+         i < DS4_PREFIX_NODE_HEADER_U32_FIELDS; i++)
+        rc = payload_write_u32(fp, header[i], err, errlen);
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++)
+        rc = payload_write_u32(fp, node->parent_n_comp[il], err, errlen);
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++)
+        rc = payload_write_u32(fp, node->n_comp[il], err, errlen);
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++)
+        rc = payload_write_u32(fp, node->parent_n_index_comp[il],
+                               err, errlen);
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++)
+        rc = payload_write_u32(fp, node->n_index_comp[il], err, errlen);
+    for (uint32_t i = parent_tokens; rc == 0 && i < total_tokens; i++)
+        rc = payload_write_u32(fp, (uint32_t)s->checkpoint.v[i],
+                               err, errlen);
+    if (rc == 0)
+        rc = payload_write_bytes(fp, s->logits,
+                                 (uint64_t)DS4_N_VOCAB * sizeof(float),
+                                 err, errlen);
+
+    uint8_t *buf = rc == 0 ? xmalloc(DS4_SESSION_IO_CHUNK) : NULL;
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        const uint32_t raw_first = total_tokens - node->raw_live;
+        for (uint32_t r = 0; rc == 0 && r < node->raw_live; r++) {
+            const uint32_t phys = (raw_first + r) % g->raw_cap;
+            rc = payload_write_tensor_span(
+                    fp, g->layer_raw_cache[il],
+                    (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
+                    (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
+                    buf, DS4_SESSION_IO_CHUNK, err, errlen);
+        }
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (rc != 0 || ratio == 0) continue;
+        const uint32_t comp_delta =
+            node->n_comp[il] - node->parent_n_comp[il];
+        if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+            rc = payload_write_tensor_span_f16_as_f32(
+                    fp, g->layer_attn_comp_cache[il],
+                    (uint64_t)node->parent_n_comp[il] *
+                        DS4_N_HEAD_DIM * sizeof(uint16_t),
+                    (uint64_t)comp_delta * DS4_N_HEAD_DIM,
+                    buf, DS4_SESSION_IO_CHUNK, err, errlen);
+        } else {
+            rc = payload_write_tensor_span(
+                    fp, g->layer_attn_comp_cache[il],
+                    (uint64_t)node->parent_n_comp[il] *
+                        DS4_N_HEAD_DIM * sizeof(float),
+                    (uint64_t)comp_delta * DS4_N_HEAD_DIM * sizeof(float),
+                    buf, DS4_SESSION_IO_CHUNK, err, errlen);
+        }
+        if (rc == 0)
+            rc = payload_write_tensor_span(
+                    fp, g->layer_attn_state_kv[il], 0,
+                    layer_attn_state_bytes(ratio),
+                    buf, DS4_SESSION_IO_CHUNK, err, errlen);
+        if (rc == 0)
+            rc = payload_write_tensor_span(
+                    fp, g->layer_attn_state_score[il], 0,
+                    layer_attn_state_bytes(ratio),
+                    buf, DS4_SESSION_IO_CHUNK, err, errlen);
+        if (rc == 0 && ratio == 4) {
+            const uint32_t index_delta =
+                node->n_index_comp[il] -
+                node->parent_n_index_comp[il];
+            rc = payload_write_tensor_span(
+                    fp, g->layer_index_comp_cache[il],
+                    (uint64_t)node->parent_n_index_comp[il] *
+                        DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                    (uint64_t)index_delta * DS4_N_INDEXER_HEAD_DIM *
+                        sizeof(float),
+                    buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            if (rc == 0)
+                rc = payload_write_tensor_span(
+                        fp, g->layer_index_state_kv[il], 0,
+                        layer_index_state_bytes(ratio),
+                        buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            if (rc == 0)
+                rc = payload_write_tensor_span(
+                        fp, g->layer_index_state_score[il], 0,
+                        layer_index_state_bytes(ratio),
+                        buf, DS4_SESSION_IO_CHUNK, err, errlen);
+        }
+    }
+    free(buf);
+    off_t written = rc == 0 ? ftello(fp) : -1;
+    if (fclose(fp) != 0 && rc == 0) rc = 1;
+    if (rc != 0 || written < 0 || (uint64_t)written != node->len) {
+        if (rc == 0)
+            payload_set_err(err, errlen,
+                            "prefix node capture length mismatch");
+        ds4_prefix_node_free(node);
+        return 1;
+    }
+    prefix_node_payload_hash(node->ptr, node->len, node->payload_hash);
+    payload_put_u32(node->ptr + 18u * sizeof(uint32_t),
+                    (uint32_t)node->payload_hash[0]);
+    payload_put_u32(node->ptr + 19u * sizeof(uint32_t),
+                    (uint32_t)(node->payload_hash[0] >> 32));
+    payload_put_u32(node->ptr + 20u * sizeof(uint32_t),
+                    (uint32_t)node->payload_hash[1]);
+    payload_put_u32(node->ptr + 21u * sizeof(uint32_t),
+                    (uint32_t)(node->payload_hash[1] >> 32));
+    *out = node;
+    return 0;
+#endif
+}
+
+static int prefix_skip_memory_bytes(FILE *fp, uint64_t bytes,
+                                    uint64_t *remaining,
+                                    char *err, size_t errlen) {
+    if (!fp || !remaining || bytes > *remaining || bytes > (uint64_t)INT64_MAX ||
+        fseeko(fp, (off_t)bytes, SEEK_CUR) != 0) {
+        payload_set_err(err, errlen, "truncated prefix node section");
+        return 1;
+    }
+    *remaining -= bytes;
+    return 0;
+}
+
+int ds4_session_prefix_chain_restore(ds4_session *s,
+                                     const ds4_prefix_node *const *chain,
+                                     size_t count,
+                                     char *err, size_t errlen) {
+    if (!s || !chain || count == 0) {
+        payload_set_err(err, errlen, "invalid prefix restore chain");
+        return 1;
+    }
+    if (s->distributed || ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
+        payload_set_err(err, errlen,
+                        "prefix nodes currently require local Flash GPU state");
+        return 1;
+    }
+#ifdef DS4_NO_GPU
+    payload_set_err(err, errlen, "graph backend support is not compiled in");
+    return 1;
+#else
+    ds4_gpu_graph *g = &s->graph;
+    s->checkpoint_valid = false;
+    s->mtp_draft_valid = false;
+    ds4_session_dspark_capture_invalidate(s);
+    g->mtp_n_raw = 0;
+    metal_graph_dspark_cache_reset(g);
+    const uint64_t compat_id = ds4_engine_prefix_compat_id(s->engine);
+    const ds4_prefix_node *leaf = chain[count - 1u];
+    token_vec new_checkpoint = {0};
+    float *new_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+
+    for (size_t i = 0; i < count; i++) {
+        const ds4_prefix_node *node = chain[i];
+        const ds4_prefix_node *parent = i ? chain[i - 1u] : NULL;
+        if (!node || node->compat_id != compat_id ||
+            node->ctx_size > (uint32_t)s->ctx_size ||
+            node->raw_window != g->raw_window ||
+            node->raw_live > g->raw_cap ||
+            node->comp_cap > g->comp_cap ||
+            node->parent_tokens != (parent ? parent->total_tokens : 0)) {
+            token_vec_free(&new_checkpoint);
+            free(new_logits);
+            payload_set_err(err, errlen, "invalid prefix restore topology");
+            return 1;
+        }
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const uint32_t want_comp = parent ? parent->n_comp[il] : 0;
+            const uint32_t want_index =
+                parent ? parent->n_index_comp[il] : 0;
+            if (node->parent_n_comp[il] != want_comp ||
+                node->parent_n_index_comp[il] != want_index ||
+                node->n_comp[il] > g->layer_comp_cap[il] ||
+                node->n_index_comp[il] > g->layer_comp_cap[il]) {
+                token_vec_free(&new_checkpoint);
+                free(new_logits);
+                payload_set_err(err, errlen,
+                                "invalid prefix restore counters");
+                return 1;
+            }
+        }
+
+        const uint64_t token_offset =
+            (uint64_t)(DS4_PREFIX_NODE_HEADER_U32_FIELDS +
+                       4u * DS4_N_LAYER) * sizeof(uint32_t);
+        const uint32_t token_delta =
+            node->total_tokens - node->parent_tokens;
+        const uint8_t *token_ptr = node->ptr + token_offset;
+        for (uint32_t t = 0; t < token_delta; t++)
+            token_vec_push(&new_checkpoint,
+                           (int)payload_get_u32(
+                               token_ptr + (uint64_t)t * sizeof(uint32_t)));
+        if (i + 1u == count) {
+            memcpy(new_logits,
+                   token_ptr + (uint64_t)token_delta * sizeof(uint32_t),
+                   (size_t)DS4_N_VOCAB * sizeof(float));
+        }
+        if (prefix_token_hash(new_checkpoint.v,
+                              (uint32_t)new_checkpoint.len) !=
+            node->token_hash) {
+            token_vec_free(&new_checkpoint);
+            free(new_logits);
+            payload_set_err(err, errlen,
+                            "prefix restore token chain mismatch");
+            return 1;
+        }
+    }
+
+    if (new_checkpoint.len != (int)leaf->total_tokens ||
+        ds4_gpu_synchronize() == 0) {
+        token_vec_free(&new_checkpoint);
+        free(new_logits);
+        payload_set_err(err, errlen,
+                        "failed to prepare accelerator for prefix restore");
+        return 1;
+    }
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    int rc = 0;
+    for (size_t i = 0; rc == 0 && i < count; i++) {
+        const ds4_prefix_node *node = chain[i];
+        const bool selected = i + 1u == count;
+        FILE *fp = fmemopen(node->ptr, (size_t)node->len, "rb");
+        if (!fp) {
+            payload_set_err(err, errlen,
+                            "failed to open prefix tensor stream");
+            rc = 1;
+            break;
+        }
+        const uint64_t tensor_offset =
+            (uint64_t)(DS4_PREFIX_NODE_HEADER_U32_FIELDS +
+                       4u * DS4_N_LAYER +
+                       (node->total_tokens - node->parent_tokens)) *
+                sizeof(uint32_t) +
+            (uint64_t)DS4_N_VOCAB * sizeof(float);
+        if (fseeko(fp, (off_t)tensor_offset, SEEK_SET) != 0) rc = 1;
+        uint64_t remaining = node->len - tensor_offset;
+        for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+            const uint64_t raw_bytes =
+                (uint64_t)node->raw_live * DS4_N_HEAD_DIM * sizeof(float);
+            if (selected) {
+                const uint32_t raw_first =
+                    node->total_tokens - node->raw_live;
+                for (uint32_t r = 0; rc == 0 && r < node->raw_live; r++) {
+                    const uint32_t phys =
+                        (raw_first + r) % g->raw_cap;
+                    rc = payload_read_tensor_span(
+                            fp, g->layer_raw_cache[il],
+                            (uint64_t)phys * DS4_N_HEAD_DIM * sizeof(float),
+                            (uint64_t)DS4_N_HEAD_DIM * sizeof(float),
+                            buf, DS4_SESSION_IO_CHUNK, &remaining,
+                            err, errlen);
+                }
+            } else {
+                rc = prefix_skip_memory_bytes(fp, raw_bytes, &remaining,
+                                              err, errlen);
+            }
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            if (rc != 0 || ratio == 0) continue;
+            const uint32_t comp_delta =
+                node->n_comp[il] - node->parent_n_comp[il];
+            if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+                rc = payload_read_tensor_span_f32_as_f16(
+                        fp, g->layer_attn_comp_cache[il],
+                        (uint64_t)node->parent_n_comp[il] *
+                            DS4_N_HEAD_DIM * sizeof(uint16_t),
+                        (uint64_t)comp_delta * DS4_N_HEAD_DIM,
+                        buf, DS4_SESSION_IO_CHUNK, &remaining,
+                        err, errlen);
+            } else {
+                rc = payload_read_tensor_span(
+                        fp, g->layer_attn_comp_cache[il],
+                        (uint64_t)node->parent_n_comp[il] *
+                            DS4_N_HEAD_DIM * sizeof(float),
+                        (uint64_t)comp_delta * DS4_N_HEAD_DIM *
+                            sizeof(float),
+                        buf, DS4_SESSION_IO_CHUNK, &remaining,
+                        err, errlen);
+            }
+            const uint64_t attn_state = layer_attn_state_bytes(ratio);
+            if (rc == 0 && selected)
+                rc = payload_read_tensor_span(
+                        fp, g->layer_attn_state_kv[il], 0, attn_state,
+                        buf, DS4_SESSION_IO_CHUNK, &remaining,
+                        err, errlen);
+            else if (rc == 0)
+                rc = prefix_skip_memory_bytes(fp, attn_state, &remaining,
+                                              err, errlen);
+            if (rc == 0 && selected)
+                rc = payload_read_tensor_span(
+                        fp, g->layer_attn_state_score[il], 0, attn_state,
+                        buf, DS4_SESSION_IO_CHUNK, &remaining,
+                        err, errlen);
+            else if (rc == 0)
+                rc = prefix_skip_memory_bytes(fp, attn_state, &remaining,
+                                              err, errlen);
+            if (rc == 0 && ratio == 4) {
+                const uint32_t index_delta =
+                    node->n_index_comp[il] -
+                    node->parent_n_index_comp[il];
+                rc = payload_read_tensor_span(
+                        fp, g->layer_index_comp_cache[il],
+                        (uint64_t)node->parent_n_index_comp[il] *
+                            DS4_N_INDEXER_HEAD_DIM * sizeof(float),
+                        (uint64_t)index_delta * DS4_N_INDEXER_HEAD_DIM *
+                            sizeof(float),
+                        buf, DS4_SESSION_IO_CHUNK, &remaining,
+                        err, errlen);
+                const uint64_t index_state =
+                    layer_index_state_bytes(ratio);
+                if (rc == 0 && selected)
+                    rc = payload_read_tensor_span(
+                            fp, g->layer_index_state_kv[il], 0,
+                            index_state, buf, DS4_SESSION_IO_CHUNK,
+                            &remaining, err, errlen);
+                else if (rc == 0)
+                    rc = prefix_skip_memory_bytes(
+                            fp, index_state, &remaining, err, errlen);
+                if (rc == 0 && selected)
+                    rc = payload_read_tensor_span(
+                            fp, g->layer_index_state_score[il], 0,
+                            index_state, buf, DS4_SESSION_IO_CHUNK,
+                            &remaining, err, errlen);
+                else if (rc == 0)
+                    rc = prefix_skip_memory_bytes(
+                            fp, index_state, &remaining, err, errlen);
+            }
+        }
+        if (fclose(fp) != 0 && rc == 0) rc = 1;
+        if (rc == 0 && remaining != 0) {
+            payload_set_err(err, errlen,
+                            "prefix node has trailing tensor bytes");
+            rc = 1;
+        }
+    }
+    free(buf);
+    if (rc == 0 && ds4_gpu_synchronize() == 0) {
+        payload_set_err(err, errlen,
+                        "failed to synchronize accelerator after prefix restore");
+        rc = 1;
+    }
+    if (rc != 0) {
+        token_vec_free(&new_checkpoint);
+        free(new_logits);
+        return 1;
+    }
+
+    token_vec_free(&s->checkpoint);
+    s->checkpoint = new_checkpoint;
+    memcpy(s->logits, new_logits,
+           (size_t)DS4_N_VOCAB * sizeof(float));
+    free(new_logits);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g->layer_n_comp[il] = leaf->n_comp[il];
+        g->layer_n_index_comp[il] = leaf->n_index_comp[il];
+    }
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    ds4_session_dspark_capture_invalidate(s);
+    g->mtp_n_raw = 0;
+    metal_graph_dspark_cache_reset(g);
+    return 0;
+#endif
 }
 
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens) {
