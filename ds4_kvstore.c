@@ -1944,9 +1944,9 @@ static void prefix_scan_disk(struct ds4_prefix_cache *pc) {
     while ((de = readdir(dir)) != NULL) {
         const size_t name_len = strlen(de->d_name);
         if (name_len > 49 && !memcmp(de->d_name + 40, ".ptn.tmp.", 9)) {
-            char base[46];
-            memcpy(base, de->d_name, 45);
-            base[45] = '\0';
+            char base[45];
+            memcpy(base, de->d_name, 44);
+            base[44] = '\0';
             char stale_id[41];
             if (prefix_filename_id(base, stale_id)) {
                 char *stale = ds4_kvstore_path_join(pc->dir, de->d_name);

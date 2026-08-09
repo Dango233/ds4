@@ -4978,6 +4978,103 @@ static bool test_truncate_one_prefix_file(const char *path) {
     return truncated;
 }
 
+static uint64_t test_prefix_hash_bytes(uint64_t h, const uint8_t *p,
+                                       size_t len) {
+    while (len--) {
+        h ^= *p++;
+        h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
+static void test_prefix_payload_hash(const uint8_t *ptr, uint64_t len,
+                                     uint64_t out[2]) {
+    const uint64_t checksum_at = 18u * sizeof(uint32_t);
+    const uint64_t payload_at = 22u * sizeof(uint32_t);
+    uint64_t h0 = UINT64_C(1469598103934665603);
+    uint64_t h1 = UINT64_C(1099511628211);
+    const uint8_t *parts[] = {ptr, ptr + payload_at};
+    const uint64_t sizes[] = {checksum_at, len - payload_at};
+    for (size_t part = 0; part < 2; part++) {
+        const uint8_t *p = parts[part];
+        uint64_t n = sizes[part];
+        while (n >= sizeof(uint64_t)) {
+            uint64_t word;
+            memcpy(&word, p, sizeof(word));
+            h0 ^= word;
+            h0 *= UINT64_C(1099511628211);
+            h1 ^= word + UINT64_C(0x9e3779b97f4a7c15) +
+                  (h1 << 6) + (h1 >> 2);
+            h1 *= UINT64_C(0xbf58476d1ce4e5b9);
+            p += sizeof(word);
+            n -= sizeof(word);
+        }
+        h0 = test_prefix_hash_bytes(h0, p, (size_t)n);
+        h1 = test_prefix_hash_bytes(h1, p, (size_t)n);
+    }
+    out[0] = h0;
+    out[1] = h1;
+}
+
+static ds4_prefix_node *test_prefix_node_without_frontier(
+        ds4_engine *engine, const ds4_prefix_node *node) {
+    const uint64_t bytes = ds4_prefix_node_bytes(node);
+    uint8_t *blob = malloc((size_t)bytes);
+    TEST_ASSERT(blob != NULL);
+    if (!blob) return NULL;
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    if (!fp) {
+        free(blob);
+        return NULL;
+    }
+    char err[256] = {0};
+    TEST_ASSERT(ds4_prefix_node_write(node, fp, err, sizeof(err)) == 0);
+    rewind(fp);
+    TEST_ASSERT(fread(blob, 1, (size_t)bytes, fp) == (size_t)bytes);
+    fclose(fp);
+
+    const uint64_t token_delta =
+        ds4_prefix_node_total_tokens(node) -
+        ds4_prefix_node_parent_tokens(node);
+    const uint32_t layers =
+        ds4_kvstore_le_get32(blob + 10u * sizeof(uint32_t));
+    const uint32_t vocab =
+        ds4_kvstore_le_get32(blob + 13u * sizeof(uint32_t));
+    const uint64_t tensor_at =
+        (uint64_t)(22u + 4u * layers) * sizeof(uint32_t) +
+        token_delta * sizeof(uint32_t) +
+        (uint64_t)vocab * sizeof(float);
+    TEST_ASSERT(tensor_at < bytes);
+    if (tensor_at >= bytes) {
+        free(blob);
+        return NULL;
+    }
+    memset(blob + tensor_at, 0, (size_t)(bytes - tensor_at));
+    uint64_t digest[2];
+    test_prefix_payload_hash(blob, bytes, digest);
+    ds4_kvstore_le_put32(blob + 18u * sizeof(uint32_t),
+                         (uint32_t)digest[0]);
+    ds4_kvstore_le_put32(blob + 19u * sizeof(uint32_t),
+                         (uint32_t)(digest[0] >> 32));
+    ds4_kvstore_le_put32(blob + 20u * sizeof(uint32_t),
+                         (uint32_t)digest[1]);
+    ds4_kvstore_le_put32(blob + 21u * sizeof(uint32_t),
+                         (uint32_t)(digest[1] >> 32));
+
+    fp = fmemopen(blob, (size_t)bytes, "rb");
+    TEST_ASSERT(fp != NULL);
+    ds4_prefix_node *incomplete = NULL;
+    if (fp) {
+        TEST_ASSERT(ds4_prefix_node_read(
+                        engine, fp, bytes, &incomplete,
+                        err, sizeof(err)) == 0);
+        fclose(fp);
+    }
+    free(blob);
+    return incomplete;
+}
+
 static void test_prefix_node_boundaries(ds4_engine *engine,
                                         const ds4_tokens *all) {
     static const int positions[] = {
@@ -5367,11 +5464,22 @@ static void test_prefix_node_chain(void) {
 
     ds4_kvstore_close(&store);
     store_open = false;
+    char stale_tmp[PATH_MAX];
+    snprintf(stale_tmp, sizeof(stale_tmp),
+             "%s/tree-v1/0000000000000000000000000000000000000000.ptn.tmp.999",
+             cache_dir);
+    fp = fopen(stale_tmp, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        TEST_ASSERT(fputc(0, fp) != EOF);
+        fclose(fp);
+    }
     store_open = ds4_kvstore_open(
         &store, cache_dir, 512, true, ds4_kvstore_default_options(),
         "ds4-test", NULL, NULL);
     TEST_ASSERT(store_open &&
                 ds4_kvstore_prefix_enable(&store, engine, 256, NULL));
+    TEST_ASSERT(access(stale_tmp, F_OK) != 0);
     ds4_kvstore_prefix_stats(&store, &prefix_stats);
     TEST_ASSERT(prefix_stats.nodes == 5);
     TEST_ASSERT(prefix_stats.durable_nodes == 5);
@@ -5436,6 +5544,42 @@ static void test_prefix_node_chain(void) {
         TEST_ASSERT(prefix_stats.ram_bytes <= 128ull * 1024ull * 1024ull);
         ds4_kvstore_close(&tiny_disk);
         test_remove_prefix_cache_dir(disk_dir);
+    }
+
+    char fail_template[] = "/tmp/ds4-prefix-write-fail-XXXXXX";
+    char *fail_dir = mkdtemp(fail_template);
+    ds4_kvstore fail_store = {0};
+    TEST_ASSERT(fail_dir != NULL);
+    if (fail_dir) {
+        TEST_ASSERT(ds4_kvstore_open(
+                        &fail_store, fail_dir, 512, true,
+                        ds4_kvstore_default_options(),
+                        "ds4-test", NULL, NULL));
+        TEST_ASSERT(ds4_kvstore_prefix_enable(
+                        &fail_store, engine, 128, NULL));
+        char fail_tree[PATH_MAX];
+        snprintf(fail_tree, sizeof(fail_tree), "%s/tree-v1", fail_dir);
+        TEST_ASSERT(chmod(fail_tree, 0500) == 0);
+        const ds4_prefix_node *root_only[] = {root};
+        TEST_ASSERT(ds4_session_prefix_chain_restore(
+                        restored, root_only, 1, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_kvstore_prefix_capture(
+                        &fail_store, engine, restored, NULL,
+                        err, sizeof(err)));
+        TEST_ASSERT(ds4_session_sync(restored, &child_prompt,
+                                     err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_kvstore_prefix_capture(
+                        &fail_store, engine, restored, NULL,
+                        err, sizeof(err)));
+        ds4_kvstore_prefix_wait_idle(&fail_store);
+        ds4_kvstore_prefix_stats(&fail_store, &prefix_stats);
+        TEST_ASSERT(prefix_stats.nodes == 2);
+        TEST_ASSERT(prefix_stats.durable_nodes == 0);
+        TEST_ASSERT(prefix_stats.pending_nodes == 0);
+        TEST_ASSERT(prefix_stats.disk_bytes == 0);
+        TEST_ASSERT(chmod(fail_tree, 0700) == 0);
+        ds4_kvstore_close(&fail_store);
+        test_remove_prefix_cache_dir(fail_dir);
     }
 
     char gc_template[] = "/tmp/ds4-prefix-gc-XXXXXX";
@@ -5539,6 +5683,42 @@ static void test_prefix_node_chain(void) {
         TEST_ASSERT(corrupt == NULL);
         fclose(fp);
     }
+
+    ds4_prefix_node *incomplete =
+        test_prefix_node_without_frontier(engine, child_disk);
+    TEST_ASSERT(incomplete != NULL);
+    if (incomplete) {
+        const ds4_prefix_node *valid_chain[] = {root_disk, child_disk};
+        const ds4_prefix_node *incomplete_chain[] = {root_disk, incomplete};
+        TEST_ASSERT(ds4_session_prefix_chain_restore(
+                        live, valid_chain, 2, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_session_prefix_chain_restore(
+                        restored, incomplete_chain, 2,
+                        err, sizeof(err)) == 0);
+        const int first = ds4_session_argmax(live);
+        TEST_ASSERT(ds4_session_argmax(restored) == first);
+        TEST_ASSERT(ds4_session_eval(live, first, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_session_eval(restored, first,
+                                     err, sizeof(err)) == 0);
+        const int cap = 200000;
+        float *valid_logits = malloc((size_t)cap * sizeof(float));
+        float *incomplete_logits = malloc((size_t)cap * sizeof(float));
+        TEST_ASSERT(valid_logits != NULL && incomplete_logits != NULL);
+        if (valid_logits && incomplete_logits) {
+            const int n = ds4_session_copy_logits(live, valid_logits, cap);
+            TEST_ASSERT(n > 0 &&
+                        ds4_session_copy_logits(
+                            restored, incomplete_logits, cap) == n);
+            TEST_ASSERT(n <= 0 ||
+                        memcmp(valid_logits, incomplete_logits,
+                               (size_t)n * sizeof(float)) != 0);
+        }
+        free(valid_logits);
+        free(incomplete_logits);
+        TEST_ASSERT(ds4_session_prefix_chain_restore(
+                        live, valid_chain, 2, err, sizeof(err)) == 0);
+    }
+    ds4_prefix_node_free(incomplete);
 
     const int logits_cap = 200000;
     float *live_logits = malloc((size_t)logits_cap * sizeof(float));
