@@ -162,6 +162,19 @@ tests/test_metal_moe_prefill: tests/test_metal_moe_prefill.o $(CORE_OBJS)
 test-metal-moe-prefill: tests/test_metal_moe_prefill
 	./tests/test_metal_moe_prefill
 
+tests/test_metal_slab_residency: tests/test_metal_slab_residency.m ds4_metal.m ds4_gpu.h ds4_image.o $(METAL_SRCS)
+	$(CC) $(OBJCFLAGS) -I. -o $@ $< ds4_image.o $(METAL_LDLIBS)
+
+.PHONY: test-metal-slab-residency
+test-metal-slab-residency: tests/test_metal_slab_residency
+	MTL_DEBUG_LAYER=1 ./tests/test_metal_slab_residency
+
+speed-bench/metal_slab_residency_bench: speed-bench/metal_slab_residency_bench.m
+	$(CC) $(OBJCFLAGS) -o $@ $< $(METAL_LDLIBS)
+
+.PHONY: metal-slab-residency-bench
+metal-slab-residency-bench: speed-bench/metal_slab_residency_bench
+
 tests/test_metal_ssd_experts.o: tests/test_metal_ssd_experts.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
@@ -540,6 +553,12 @@ tests/test_ssd_cache: tests/test_ssd_cache.c ds4_ssd.c ds4_ssd.h
 test-ssd-cache: tests/test_ssd_cache
 	./tests/test_ssd_cache
 
+speed-bench/engram_decode_bench: speed-bench/engram_decode_bench.c ds4_engram.c ds4_engram.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $< ds4_engram.c -lm
+
+.PHONY: engram-decode-bench
+engram-decode-bench: speed-bench/engram_decode_bench
+
 tests/test_engram: tests/test_engram.c ds4_engram.c ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ tests/test_engram.c ds4_engram.c -lm
 
@@ -841,6 +860,7 @@ tests/test_session_state_gpu.o: ds4_tool_text.h
 clean:
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_command_memory
+	rm -f tests/test_metal_slab_residency speed-bench/metal_slab_residency_bench
 	rm -f tests/test_deepseek41_metal
 	rm -f tests/test_deepseek41_gguf
 	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli
@@ -851,6 +871,7 @@ clean:
 	rm -f tests/test_quality_api
 	rm -f tests/test_linux_memory tests/test_rocm_memory
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm
+	rm -f speed-bench/engram_decode_bench
 	rm -f tests/test_ssd_cache tests/test_engram
 	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands
 	rm -f tests/test_tp_rdma
