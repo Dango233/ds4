@@ -41,3 +41,25 @@ Each optimization includes its own tests and measurements:
 The independent optimization measurements use an M2 Ultra with 192 GiB,
 macOS 15.7.4 and the calibrated DeepSeek V4.1 Flash Q2 GGUF. Cross-device
 behavior and full release QA require separate validation.
+
+## Consolidation checks (2026-09-13)
+
+The consolidation preserves fork/main history and includes upstream
+`bd66c402070042bf0a79ad6ece8242de4c93680c` and the three optimization PR commits.
+
+Validation on the M2 Ultra:
+
+- Metal and CPU compilation, followed by fresh Metal executable links.
+- Frontend, Engram, V4.1 GGUF and quality-tool unit tests.
+- Real-model `/v1/completions` requests in raw and default modes, each with JSON
+  and SSE output, with and without `ignore_eos`. Trace checks verify that raw
+  prompts are unchanged and default prompts use the model template.
+- A 2,048-token prefill and 512-token decode with all three optimization flags
+  enabled: 75.55 prefill t/s, 16.81 full decode t/s, 16.93 t/s after the first
+  token. The generated output matches the previously tested combined branch.
+  [Raw CSV](../speed-bench/fork_main_m2_ultra.csv).
+
+The performance check uses `speed-bench/promessi_sposi.txt`, `--ctx-alloc 8257`,
+SSD streaming and the same calibrated V4.1 Q2 model recorded in the individual
+reports. This is one consolidation run. The SDK 15 build retains the two
+upstream unused Metal 4 symbol warnings.

@@ -1034,6 +1034,12 @@ static bool request_thinking_controls_are_stops(const request *r) {
     return r && !r->raw_completion && !ds4_think_mode_enabled(r->think_mode);
 }
 
+/* Raw completions let the client's prompt control thinking markers, including
+ * when ignore_eos uses the engine's stop-aware argmax path. */
+static ds4_think_mode request_stop_think_mode(const request *r) {
+    return r->raw_completion ? DS4_THINK_HIGH : r->think_mode;
+}
+
 static bool request_token_is_stop(ds4_engine *e, const request *r, int token) {
     if (ds4_token_is_stop(e, token)) return true;
     return request_thinking_controls_are_stops(r) &&
@@ -13141,7 +13147,7 @@ decode_again:
         const int eos_token = ds4_token_eos(s->engine);
         int token = j->req.ignore_eos ?
             ds4_session_argmax_ignoring_eos(slot->session,
-                                            j->req.think_mode) :
+                                            request_stop_think_mode(&j->req)) :
             ds4_session_sample(slot->session, temperature, top_k,
                                top_p, min_p, &rng);
         if (token < 0) {
@@ -13166,7 +13172,7 @@ decode_again:
             if (j->req.ignore_eos) {
                 ntok = ds4_session_eval_speculative_argmax_ignoring_eos(
                     slot->session, token, max_tokens - completion,
-                    eos_token, j->req.think_mode,
+                    eos_token, request_stop_think_mode(&j->req),
                     toks, (int)(sizeof(toks) / sizeof(toks[0])),
                     err, sizeof(err));
             } else {
@@ -17071,9 +17077,11 @@ static void test_raw_completion_does_not_stop_on_thinking_controls(void) {
 
     r.think_mode = DS4_THINK_NONE;
     TEST_ASSERT(request_thinking_controls_are_stops(&r));
+    TEST_ASSERT(request_stop_think_mode(&r) == DS4_THINK_NONE);
 
     r.raw_completion = true;
     TEST_ASSERT(!request_thinking_controls_are_stops(&r));
+    TEST_ASSERT(ds4_think_mode_enabled(request_stop_think_mode(&r)));
 
     r.raw_completion = false;
     r.think_mode = DS4_THINK_HIGH;
