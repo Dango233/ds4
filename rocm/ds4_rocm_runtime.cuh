@@ -18,12 +18,26 @@ static uint64_t g_selected_readback_event_value;
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 #ifdef __HIP_PLATFORM_AMD__
+static rocblas_handle g_rocblas;
+static int g_rocblas_ready;
+/* rocBLAS solution indices are library-version specific. Unknown versions use
+ * the library default; a rejected known solution disables the tuned path. */
+enum {
+    DS4_ROCBLAS_F16_SOLUTIONS_NONE = 0,
+    DS4_ROCBLAS_F16_SOLUTIONS_5_5_CD957402,
+    DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E,
+};
+static int g_rocblas_f16_solution_set;
+static int g_rocblas_f16_solutions_disabled;
+static int g_rocblas_attention_b_solution_disabled;
 #include "ds4_rocm_hipblaslt.cuh"
 #endif
 static int g_quality_mode;
+static int g_glm_model;
 
 enum {
     DS4_ROCM_N_EXPERT = 256u,
+    DS4_ROCM_GLM53_N_EXPERT = 288u,
     DS4_ROCM_MAX_N_EXPERT = 384u,
     DS4_ROCM_N_EXPERT_USED = 8u,
     DS4_ROCM_STREAM_READ_WORKERS = DS4_ROCM_N_EXPERT_USED * 3u,
@@ -57,6 +71,7 @@ struct cuda_model_image {
     const void *host_base;
     uint64_t size;
     char *device_ptr;
+    uint64_t device_offset;
 };
 
 struct cuda_q8_f16_range {
@@ -597,11 +612,28 @@ static int cuda_model_image_find(const void *model_map) {
 }
 
 static const char *cuda_model_image_ptr(const void *model_map, uint64_t offset) {
-    const int idx = cuda_model_image_find(model_map);
-    if (idx < 0) return NULL;
-    const cuda_model_image &img = g_model_images[(size_t)idx];
-    if (offset > img.size) return NULL;
-    return img.device_ptr + offset;
+    for (const cuda_model_image &img : g_model_images) {
+        if (img.host_base != model_map || offset < img.device_offset) continue;
+        const uint64_t rel = offset - img.device_offset;
+        if (rel >= img.size) continue;
+        return img.device_ptr + rel;
+    }
+    return NULL;
+}
+
+static const char *cuda_model_image_range_ptr(
+        const void *model_map,
+        uint64_t    offset,
+        uint64_t    bytes) {
+    if (bytes == 0) return cuda_model_image_ptr(model_map, offset);
+    for (const cuda_model_image &img : g_model_images) {
+        if (img.host_base != model_map || offset < img.device_offset) continue;
+        const uint64_t rel = offset - img.device_offset;
+        if (rel <= img.size && bytes <= img.size - rel) {
+            return img.device_ptr + rel;
+        }
+    }
+    return NULL;
 }
 
 static int cuda_model_image_owned(const void *model_map) {
@@ -4491,7 +4523,6 @@ static int cuda_stream_selected_apply(
         const char **down_w) {
     if (g_ssd_streaming_mode &&
         !g_stream_selected_cache.loaded &&
-        getenv("DS4_ROCM_DISABLE_STREAMING_SPLIT_SELECTED") != NULL &&
         cuda_stream_selected_pending_matches(model_map,
                                              layer,
                                              n_total_expert,
@@ -4570,7 +4601,9 @@ static const char *cuda_model_range_copy_uncached(
 
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
-    if (cuda_model_image_owned(model_map)) return cuda_model_ptr(model_map, offset);
+    const char *image_ptr =
+        cuda_model_image_range_ptr(model_map, offset, bytes);
+    if (image_ptr) return image_ptr;
 
     const uint64_t end = offset + bytes;
     auto exact = g_model_range_by_offset.find(offset);
@@ -4669,7 +4702,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return 1;
-    if (cuda_model_image_owned(model_map)) return 1;
+    if (cuda_model_image_range_ptr(model_map, offset, bytes)) return 1;
 
     const uint64_t end = offset + bytes;
     if (end < offset) return 0;
@@ -4728,11 +4761,18 @@ static uint32_t cuda_rows_per_block_env_or_default(const char *name, uint32_t de
 
 struct ds4_rocm_runtime_config {
     int initialized;
+    int q8_prequant_decode;
     int disable_splitk_attn_out_low;
     int disable_shared_gate_up_fused_w32;
     int attention_output_cublas_all;
     int shared_down_cublas;
+    int glm_grouped_value_project;
+    int glm_grouped_qk_low;
+    int q8_decode_sharedx_64k;
     int graph_dump;
+    uint32_t q8_decode_rpb;
+    uint32_t q8_hc_decode_rpb;
+    uint32_t attn_out_low_decode_rpb;
     uint32_t moe_decode_rpb;
     uint32_t moe_decode_gate_rpb;
     uint32_t moe_decode_down_rpb;
@@ -4743,13 +4783,59 @@ static ds4_rocm_runtime_config g_rocm_cfg;
 
 static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
     if (!g_rocm_cfg.initialized) {
+        const char *q8_prequant_env =
+            getenv("DS4_ROCM_Q8_PREQUANT_DECODE");
+        /*
+         * Prequantized Q8 decode kernels are substantially faster on gfx1151.
+         * Quality mode retains the full-F32 activation path, and an explicit
+         * =0 remains available as a diagnostic rollback.
+         */
+        g_rocm_cfg.q8_prequant_decode =
+            !g_quality_mode &&
+            (q8_prequant_env == NULL ||
+             cuda_env_present(q8_prequant_env));
         g_rocm_cfg.disable_splitk_attn_out_low = !g_quality_mode;
         g_rocm_cfg.disable_shared_gate_up_fused_w32 = !g_quality_mode;
         g_rocm_cfg.attention_output_cublas_all = !g_quality_mode;
         g_rocm_cfg.shared_down_cublas = !g_quality_mode;
-        g_rocm_cfg.graph_dump =
+        const char *glm_grouped_value_project_env =
+            getenv("DS4_ROCM_GLM_GROUPED_VALUE_PROJECT");
+        /*
+         * The grouped batch kernel is the validated production path.  Keep
+         * the environment variable as an explicit =0 correctness fallback.
+         */
+        g_rocm_cfg.glm_grouped_value_project =
+            glm_grouped_value_project_env == NULL ||
+            cuda_env_present(glm_grouped_value_project_env);
+        const char *glm_grouped_qk_low_env =
+            getenv("DS4_ROCM_GLM_GROUPED_QK_LOW");
+        g_rocm_cfg.glm_grouped_qk_low =
+            glm_grouped_qk_low_env == NULL ||
+            cuda_env_present(glm_grouped_qk_low_env);
+        const char *q8_decode_sharedx_64k_env =
+            getenv("DS4_ROCM_Q8_DECODE_SHAREDX_64K");
+        /*
+         * The 64 KiB shared-input path is bit-exact on gfx1151 and falls back
+         * automatically when a device cannot launch that much dynamic LDS.
+         * Keep an explicit =0 diagnostic rollback.
+         */
+        g_rocm_cfg.q8_decode_sharedx_64k =
+            q8_decode_sharedx_64k_env == NULL ||
+            cuda_env_present(q8_decode_sharedx_64k_env);
+        const int graph_dump_requested =
             cuda_env_present(getenv("DS4_ROCM_GRAPH_DUMP_PREFIX")) ||
             cuda_env_present(getenv("DS4_METAL_GRAPH_DUMP_PREFIX"));
+        /* Graph dumps traditionally select conservative kernels so their
+         * intermediate tensors are easier to inspect.  Correctness bisects
+         * sometimes need the opposite: observe the exact production kernel
+         * path without the diagnostic changing it. */
+        const int graph_dump_noninvasive =
+            cuda_env_present(getenv("DS4_ROCM_GRAPH_DUMP_NONINVASIVE"));
+        g_rocm_cfg.graph_dump =
+            graph_dump_requested && !graph_dump_noninvasive;
+        g_rocm_cfg.q8_decode_rpb = 1u;
+        g_rocm_cfg.q8_hc_decode_rpb = 16u;
+        g_rocm_cfg.attn_out_low_decode_rpb = 32u;
         const char *moe_decode_rpb_env = getenv("DS4_ROCM_MOE_DECODE_RPB");
         const int moe_decode_rpb_env_present =
             moe_decode_rpb_env != NULL && moe_decode_rpb_env[0] != '\0';
@@ -4773,6 +4859,10 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
         g_rocm_cfg.initialized = 1;
     }
     return &g_rocm_cfg;
+}
+
+static bool cuda_q8_prequant_decode_enabled(void) {
+    return cuda_runtime_config()->q8_prequant_decode;
 }
 
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
@@ -4811,15 +4901,9 @@ static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
     if (g_ssd_streaming_mode) {
         return cuda_stream_resident_free_reserve_bytes();
     }
-    if (total_bytes >= 112ull * 1024ull * 1024ull * 1024ull) {
-        return 512ull * 1048576ull;
-    }
-
-    /* The expanded Q8->F16 cache is only an acceleration path.  Keep enough
-     * device memory free for cuBLAS workspaces, transient graph buffers, and
-     * driver bookkeeping instead of letting optional cached weights consume the
-     * last few GiB on 96 GiB cards. */
-    const uint64_t min_reserve = 4096ull * 1048576ull;
+    /* Optional expanded weights must leave room for BLAS workspaces, transient
+     * graph buffers and the OS on unified-memory devices. */
+    const uint64_t min_reserve = 8192ull * 1048576ull;
     const uint64_t pct_reserve = total_bytes / 20u; /* 5% */
     return pct_reserve > min_reserve ? pct_reserve : min_reserve;
 }
@@ -4918,6 +5002,10 @@ static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_
     if (g_quality_mode) return 0;
     if (g_q8_f16_disabled_after_oom) return 0;
     if (g_q8_f16_disabled_for_multi_model) return 0;
+    /* Resident GLM nearly fills a 128 GB unified-memory host, and its decode
+     * uses native Q8 kernels. Avoid speculative F16 copies that are discarded
+     * as soon as the remaining headroom is exhausted. */
+    if (g_glm_model && !g_ssd_streaming_mode) return 0;
     if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
     if (!label) return 0;
     if (strstr(label, "attn_output_a") != NULL ||
@@ -5450,15 +5538,6 @@ static int cuda_stream_model_cache_prepare_memory(
     return 1;
 }
 
-static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
-    uint64_t bytes = 1792ull * 1048576ull;
-    if (bytes < need) {
-        const uint64_t align = 256ull * 1048576ull;
-        bytes = (need + align - 1u) & ~(align - 1u);
-    }
-    return bytes;
-}
-
 static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_model_cache_full) return NULL;
@@ -5477,17 +5556,35 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || aligned > limit - g_model_range_bytes) return NULL;
 
-    const uint64_t chunk = cuda_model_arena_chunk_bytes(aligned);
+    const uint64_t chunk = ds4_rocm_model_arena_bytes(aligned);
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
     if (err != cudaSuccess) {
-        fprintf(stderr, DS4_GPU_LOG_PREFIX "model arena alloc failed for %s (%.2f MiB chunk): %s\n",
-                what ? what : "weights",
-                (double)chunk / 1048576.0,
-                cudaGetErrorString(err));
         (void)cudaGetLastError();
-        g_model_cache_full = 1;
-        return NULL;
+        uint64_t fallback = chunk / 2u;
+        while (fallback >= aligned) {
+            err = cudaMalloc(&dev, (size_t)fallback);
+            if (err == cudaSuccess) break;
+            (void)cudaGetLastError();
+            fallback /= 2u;
+        }
+        if (err != cudaSuccess) {
+            err = cudaMalloc(&dev, (size_t)aligned);
+            if (err != cudaSuccess) {
+                fprintf(stderr,
+                        DS4_GPU_LOG_PREFIX "model arena alloc failed for %s "
+                        "(%.2f MiB request): %s\n",
+                        what ? what : "weights",
+                        (double)aligned / 1048576.0,
+                        cudaGetErrorString(err));
+                (void)cudaGetLastError();
+                g_model_cache_full = 1;
+                return NULL;
+            }
+            fallback = aligned;
+        }
+        g_model_arenas.push_back({(char *)dev, fallback, aligned});
+        return (char *)dev;
     }
     g_model_arenas.push_back({(char *)dev, chunk, aligned});
     return (char *)dev;
@@ -5595,17 +5692,12 @@ static const char *cuda_model_range_ptr_from_fd(
 
 static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
     if (!model_map || model_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
-    if (cuda_model_image_owned(model_map)) {
-        g_model_host_base = model_map;
-        g_model_device_base = cuda_model_image_ptr(model_map, 0);
-        g_model_registered_size = model_size;
-        g_model_device_owned = 1;
-        return 1;
-    }
+    if (map_size == 0) return 0;
+    if (cuda_model_image_range_ptr(model_map, map_offset, map_size)) return 1;
 
     void *dev = NULL;
     const double t0 = cuda_wall_sec();
-    cudaError_t err = cudaMalloc(&dev, (size_t)model_size);
+    cudaError_t err = cudaMalloc(&dev, (size_t)map_size);
     if (err != cudaSuccess) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "model allocation skipped: %s\n", cudaGetErrorString(err));
         (void)cudaGetLastError();
@@ -5613,7 +5705,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
     }
 
     fprintf(stderr, DS4_GPU_LOG_PREFIX "chunk-copying %.2f GiB model image\n",
-            (double)model_size / 1073741824.0);
+            (double)map_size / 1073741824.0);
 
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
     const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
@@ -5624,8 +5716,8 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
 
     uint64_t copied = 0;
     uint64_t chunk_idx = 0;
-    while (copied < model_size) {
-        const uint64_t n = (model_size - copied < chunk) ? (model_size - copied) : chunk;
+    while (copied < map_size) {
+        const uint64_t n = (map_size - copied < chunk) ? (map_size - copied) : chunk;
         const uint64_t bi = chunk_idx % 4u;
         if (chunk_idx >= 4u) {
             err = cudaEventSynchronize(g_model_stage_event[bi]);
@@ -5638,7 +5730,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
         }
         const char *payload = NULL;
         if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
-                                   copied, n, &payload)) {
+                                   map_offset + copied, n, &payload)) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX "model staged read failed at %.2f GiB: %s\n",
                     (double)copied / 1073741824.0, strerror(errno));
             (void)cudaFree(dev);
@@ -5660,11 +5752,12 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
             (void)cudaGetLastError();
             return 0;
         }
-        cuda_model_drop_file_pages(copied, n);
-        cuda_model_discard_source_pages(model_map, model_size, copied, n);
+        cuda_model_drop_file_pages(map_offset + copied, n);
+        cuda_model_discard_source_pages(model_map, model_size,
+                                        map_offset + copied, n);
         copied += n;
         chunk_idx++;
-        cuda_model_load_progress_note(copied > map_offset ? copied - map_offset : 0);
+        cuda_model_load_progress_note(copied);
     }
     err = cudaStreamSynchronize(g_model_upload_stream);
     if (err != cudaSuccess) {
@@ -5673,9 +5766,12 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
         (void)cudaGetLastError();
         return 0;
     }
-    g_model_images.push_back({model_map, model_size, (char *)dev});
+    g_model_images.push_back({model_map, map_size, (char *)dev, map_offset});
     g_model_host_base = model_map;
-    g_model_device_base = (const char *)dev;
+    /* Sparse layer slices may create several disjoint device images, so no
+     * single base pointer can represent this model. Tensor lookups scan the
+     * image table and subtract each image's file offset. */
+    g_model_device_base = NULL;
     g_model_registered_size = model_size;
     g_model_device_owned = 1;
     const double t1 = cuda_wall_sec();
@@ -5733,6 +5829,25 @@ extern "C" int ds4_gpu_init(void) {
         g_cublas_ready = 1;
     }
 #ifdef __HIP_PLATFORM_AMD__
+    if (!g_rocblas_ready) {
+        const rocblas_status st = rocblas_create_handle(&g_rocblas);
+        if (st != rocblas_status_success) {
+            fprintf(stderr, "ds4: rocBLAS create handle failed: status %d\n", (int)st);
+            return 0;
+        }
+        char version[64] = {0};
+        g_rocblas_f16_solution_set = DS4_ROCBLAS_F16_SOLUTIONS_NONE;
+        if (rocblas_get_version_string(version, sizeof(version)) == rocblas_status_success) {
+            if (strcmp(version, "5.5.0.cd957402") == 0) {
+                g_rocblas_f16_solution_set = DS4_ROCBLAS_F16_SOLUTIONS_5_5_CD957402;
+            } else if (strcmp(version, "5.6.0.8d1ae90e") == 0) {
+                g_rocblas_f16_solution_set = DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E;
+            }
+        }
+        __atomic_store_n(&g_rocblas_f16_solutions_disabled, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_rocblas_attention_b_solution_disabled, 0, __ATOMIC_RELAXED);
+        g_rocblas_ready = 1;
+    }
     if (!g_hipblaslt_ready) {
         if (hipblaslt_ok(hipblasLtCreate(&g_hipblaslt), "create handle")) {
             g_hipblaslt_ready = 1;
@@ -5747,6 +5862,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_stream_cache_stats_print("cleanup");
     cuda_shared_gate_up_async_cleanup();
 #ifdef __HIP_PLATFORM_AMD__
+    hipblaslt_dspark_a_clear();
     hipblaslt_gemm_plan_clear();
 #endif
     if (g_cublas_ready) {
@@ -5755,6 +5871,14 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cublas = NULL;
     }
 #ifdef __HIP_PLATFORM_AMD__
+    if (g_rocblas_ready) {
+        (void)rocblas_destroy_handle(g_rocblas);
+        g_rocblas_ready = 0;
+        g_rocblas = NULL;
+        g_rocblas_f16_solution_set = DS4_ROCBLAS_F16_SOLUTIONS_NONE;
+        __atomic_store_n(&g_rocblas_f16_solutions_disabled, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_rocblas_attention_b_solution_disabled, 0, __ATOMIC_RELAXED);
+    }
     if (g_hipblaslt_ready) {
         (void)hipblasLtDestroy(g_hipblaslt);
         g_hipblaslt_ready = 0;
@@ -6066,6 +6190,25 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
     return 1;
 }
 
+extern "C" int ds4_gpu_set_aux_model_map_range(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t map_offset,
+        uint64_t map_size) {
+    if (!model_map || model_size == 0 || map_size == 0 ||
+        map_offset > model_size || map_size > model_size - map_offset) {
+        return 0;
+    }
+    if (cuda_model_range_is_cached(model_map, map_offset, map_size)) return 1;
+    if (!cuda_model_range_copy_uncached(model_map, map_offset, map_size,
+                                        "GLM-5.3 vision encoder")) {
+        return 0;
+    }
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "mapped %.2f GiB auxiliary model\n",
+            (double)map_size / 1073741824.0);
+    return 1;
+}
+
 extern "C" int ds4_gpu_set_model_map_spans(
         const void *model_map,
         uint64_t model_size,
@@ -6119,11 +6262,51 @@ extern "C" int ds4_gpu_set_model_map_spans(
         }
         return 1;
     }
-    /*
-     * The spans can be sparse distributed layer slices.  Materializing their
-     * min..max envelope can be much larger than the actual selected tensors.
-     * Leave the precise per-tensor preparation to accelerator_cache_model_tensors().
-     */
+
+    uint64_t span_bytes = 0;
+    uint64_t min_offset = offsets[0];
+    uint64_t max_end = offsets[0] + sizes[0];
+    for (uint32_t i = 0; i < count; i++) {
+        if (span_bytes > UINT64_MAX - sizes[i]) return 0;
+        span_bytes += sizes[i];
+        if (offsets[i] < min_offset) min_offset = offsets[i];
+        const uint64_t end = offsets[i] + sizes[i];
+        if (end > max_end) max_end = end;
+    }
+
+    /* Preserve the working rocm-multi-node residency policy: copy tight
+     * slices once, but split sparse coordinator layer+head selections into
+     * separate device images instead of allocating their huge file envelope. */
+    const uint64_t bbox = max_end - min_offset;
+    if (bbox <= span_bytes + span_bytes / 10u) {
+        return cuda_model_copy_chunked(model_map, model_size,
+                                       min_offset, bbox);
+    }
+
+    std::vector<std::pair<uint64_t, uint64_t>> sorted(count);
+    for (uint32_t i = 0; i < count; i++) {
+        sorted[i] = {offsets[i], offsets[i] + sizes[i]};
+    }
+    std::sort(sorted.begin(), sorted.end());
+    uint64_t group_offset = sorted[0].first;
+    uint64_t group_end = sorted[0].second;
+    const uint64_t merge_gap = 64ull * 1024ull;
+    for (uint32_t i = 1; i <= count; i++) {
+        if (i < count &&
+            (sorted[i].first <= group_end ||
+             sorted[i].first - group_end <= merge_gap)) {
+            if (sorted[i].second > group_end) group_end = sorted[i].second;
+            continue;
+        }
+        if (!cuda_model_copy_chunked(model_map, model_size,
+                                     group_offset, group_end - group_offset)) {
+            return 0;
+        }
+        if (i < count) {
+            group_offset = sorted[i].first;
+            group_end = sorted[i].second;
+        }
+    }
     return 1;
 }
 
