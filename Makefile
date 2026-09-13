@@ -540,6 +540,12 @@ tests/test_ssd_cache: tests/test_ssd_cache.c ds4_ssd.c ds4_ssd.h
 test-ssd-cache: tests/test_ssd_cache
 	./tests/test_ssd_cache
 
+speed-bench/engram_decode_bench: speed-bench/engram_decode_bench.c ds4_engram.c ds4_engram.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $< ds4_engram.c -lm
+
+.PHONY: engram-decode-bench
+engram-decode-bench: speed-bench/engram_decode_bench
+
 tests/test_engram: tests/test_engram.c ds4_engram.c ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ tests/test_engram.c ds4_engram.c -lm
 
@@ -851,6 +857,7 @@ clean:
 	rm -f tests/test_quality_api
 	rm -f tests/test_linux_memory tests/test_rocm_memory
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm
+	rm -f speed-bench/engram_decode_bench
 	rm -f tests/test_ssd_cache tests/test_engram
 	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands
 	rm -f tests/test_tp_rdma
