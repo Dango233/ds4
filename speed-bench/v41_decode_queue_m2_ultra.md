@@ -1,5 +1,9 @@
 # DeepSeek V4.1 Flash: bounded streaming decode queue
 
+For current-upstream results and the known upstream router test failure, see
+[2026-09-14 revalidation](#upstream-revalidation-2026-09-14).
+The diagnosis and validation below describe the original 2026-09-13 base.
+
 ## Problem and diagnosis
 
 After removing the large-slab submission cliff, single-host SSD decoding still
@@ -90,3 +94,52 @@ Command: the SSD streaming example in [README](README.md#metal-decode-schedule-a
 The SDK 15 build retains two upstream unused Metal 4 symbol warnings. Full
 legacy `make test` was not run against mismatched older Flash vectors. These
 focused V4.1 results do not establish release, multi-host or other-backend QA.
+
+## Upstream revalidation (2026-09-14)
+
+Revalidated after merging upstream `a04f46fa423e45712c8c7e430eff422479f314a3`
+(DeepSeek V4.1 CUDA support). The original measurements above remain historical.
+The host, exact model, prompt, context allocation, cache policy, and independent
+ABBA procedure are unchanged. Each variant was measured twice on this host.
+
+The opt-in single-host queue condition is now explicitly guarded by
+`__APPLE__`; upstream CUDA decode and existing TP eligibility are preserved.
+
+[New raw model CSV](v41_decode_queue_m2_ultra_20260914.csv).
+
+| Run | Variant | Prefill t/s | Decode t/s | First token ms | Steady t/s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1 | control | 67.40 | 10.13 | 394.734 | 10.19 |
+| 2 | candidate | 66.23 | 11.30 | 330.683 | 11.37 |
+| 3 | candidate | 66.39 | 11.33 | 362.067 | 11.40 |
+| 4 | control | 68.84 | 10.21 | 353.083 | 10.27 |
+
+Mean 512-token decode: 10.170 → 11.315 t/s (+11.3%).
+All four decoded outputs match exactly.
+
+Balanced same-engine harness:
+
+```text
+variant=control first_split=2 second_split=32 tokens=512 seconds=42.651979 tokens_per_second=12.0041
+variant=candidate first_split=2 second_split=32 tokens=512 seconds=38.513994 tokens_per_second=13.2939
+exact_rows=529 exact_floats=68389120 exact_selected_ids=528 vocab=129280
+```
+
+Validation rerun: clean Metal build, CPU compilation and restored Metal links;
+frontend, Engram, V4.1 GGUF and quality-tool unit tests. Under Metal API
+validation, compact carry, index scores/top-k, general top-k, index projection,
+embedding and TP attention subtests pass. The forced-eviction real-model queue
+parity test passes for complete logits, history and saved cache spans.
+
+The full `test-deepseek41-metal` suite fails in the new upstream router test
+at `tests/test_deepseek41_metal.c:105`. An unmodified checkout of the same
+upstream commit reproduces exactly the same failure under Metal API validation:
+
+```text
+router n=256 mode=0 rows=1 row=0 expert=4
+logit=-11.8886719 actual=0.00263455603 ref=0.00262947031
+```
+
+No kernel or tolerance was changed to bypass it. The full kernel suite is
+therefore not green. CUDA/ROCm hardware and full legacy `make test` were not
+executed. The two existing SDK 15 unused Metal 4 symbol warnings remain.
