@@ -1,5 +1,9 @@
 # DeepSeek V4.1 Flash: parallel uncached Engram decode reads
 
+For current-upstream results and the known upstream router test failure, see
+[2026-09-14 revalidation](#upstream-revalidation-2026-09-14).
+The diagnosis and validation below describe the original 2026-09-13 base.
+
 ## Problem and diagnosis
 
 One token reads 24 native Engram rows at each of two layers. Each row is only
@@ -92,3 +96,48 @@ possible token distribution, storage device or shared-host load.
 The SDK 15 build retains two upstream unused Metal 4 symbol warnings. Full
 legacy `make test` was not run against mismatched older Flash vectors. Other
 platforms were not executed; CPU portability was compile-checked only.
+
+## Upstream revalidation (2026-09-14)
+
+Revalidated after merging upstream `a04f46fa423e45712c8c7e430eff422479f314a3`
+(DeepSeek V4.1 CUDA support). The original measurements above remain historical.
+The host, exact model, prompt, context allocation, cache policy, and independent
+ABBA procedure are unchanged. Each variant was measured twice on this host.
+
+Upstream added a non-macOS pthread path for large batched reads. This change
+still applies only to macOS single-token 24-row reads; both paths and their
+EDOM/EIO tests are retained.
+
+[New raw model CSV](v41_engram_m2_ultra_20260914.csv).
+
+| Run | Variant | Prefill t/s | Decode t/s | First token ms | Steady t/s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1 | control | 68.43 | 10.20 | 341.775 | 10.26 |
+| 2 | candidate | 68.65 | 10.72 | 331.508 | 10.78 |
+| 3 | candidate | 68.63 | 10.76 | 338.298 | 10.82 |
+| 4 | control | 68.66 | 10.21 | 353.569 | 10.26 |
+
+Mean 512-token decode: 10.205 → 10.740 t/s (+5.2%).
+All four decoded outputs match exactly.
+
+Real-row reads, excluding pass 0: 4.898 → 1.418 ms per token
+for both tables, with bitwise output checks. [Raw row CSV](v41_engram_m2_ultra_rows_20260914.csv).
+
+Validation rerun: clean Metal build, CPU compilation and restored Metal links;
+frontend, Engram, V4.1 GGUF and quality-tool unit tests. Under Metal API
+validation, compact carry, index scores/top-k, general top-k, index projection,
+embedding and TP attention subtests pass. The real-model session fixture
+passes with parallel Engram reads enabled.
+
+The full `test-deepseek41-metal` suite fails in the new upstream router test
+at `tests/test_deepseek41_metal.c:105`. An unmodified checkout of the same
+upstream commit reproduces exactly the same failure under Metal API validation:
+
+```text
+router n=256 mode=0 rows=1 row=0 expert=4
+logit=-11.8886719 actual=0.00263455603 ref=0.00262947031
+```
+
+No kernel or tolerance was changed to bypass it. The full kernel suite is
+therefore not green. CUDA/ROCm hardware and full legacy `make test` were not
+executed. The two existing SDK 15 unused Metal 4 symbol warnings remain.
