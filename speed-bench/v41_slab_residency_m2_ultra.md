@@ -1,5 +1,9 @@
 # DeepSeek V4.1 Flash: owned Metal slab residency
 
+For current-upstream results and the known upstream router test failure, see
+[2026-09-14 revalidation](#upstream-revalidation-2026-09-14).
+The diagnosis and validation below describe the original 2026-09-13 base.
+
 ## Problem and diagnosis
 
 DeepSeek V4.1 Flash SSD decoding on this host fell to approximately 0.26 tokens/s
@@ -97,3 +101,41 @@ warnings as the upstream base. Full legacy `make test` was not run: its default
 model vectors target the older Flash checkpoint; the V4.1 checks above were
 used. This is single-host Metal evidence, not a release sign-off or validation
 of CUDA, ROCm, RDMA, other Macs, or all memory-pressure conditions.
+
+## Upstream revalidation (2026-09-14)
+
+Revalidated after merging upstream `a04f46fa423e45712c8c7e430eff422479f314a3`
+(DeepSeek V4.1 CUDA support). The original measurements above remain historical.
+The host, exact model, prompt, context allocation, cache policy, and independent
+ABBA procedure are unchanged. Each variant was measured twice on this host.
+
+[New raw model CSV](v41_slab_residency_m2_ultra_20260914.csv).
+
+| Run | Variant | Prefill t/s | Decode t/s | First token ms | Steady t/s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1 | control | 72.13 | 0.24 | 4289.607 | 0.24 |
+| 2 | candidate | 67.99 | 9.35 | 333.096 | 13.41 |
+| 3 | candidate | 67.81 | 9.27 | 336.455 | 13.31 |
+| 4 | control | 61.97 | 0.24 | 4037.232 | 0.24 |
+
+Mean 8-token decode: 0.240 → 9.310 t/s (38.8×).
+All four decoded outputs match exactly.
+
+Validation rerun: clean Metal build, CPU compilation and restored Metal links;
+frontend, Engram, V4.1 GGUF and quality-tool unit tests. Under Metal API
+validation, compact carry, index scores/top-k, general top-k, index projection,
+embedding and TP attention subtests pass. Slab lifecycle, SSD expert kernels,
+MoE prefill, admission/address checks and the real-model session fixture pass.
+
+The full `test-deepseek41-metal` suite fails in the new upstream router test
+at `tests/test_deepseek41_metal.c:105`. An unmodified checkout of the same
+upstream commit reproduces exactly the same failure under Metal API validation:
+
+```text
+router n=256 mode=0 rows=1 row=0 expert=4
+logit=-11.8886719 actual=0.00263455603 ref=0.00262947031
+```
+
+No kernel or tolerance was changed to bypass it. The full kernel suite is
+therefore not green. CUDA/ROCm hardware and full legacy `make test` were not
+executed. The two existing SDK 15 unused Metal 4 symbol warnings remain.
