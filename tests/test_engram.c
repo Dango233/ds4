@@ -191,6 +191,7 @@ static void test_rows(void) {
     bad = 0;
     assert(!ds4_engram_read(&t, &bad, 1, out) && errno == EDOM);
     assert(!ds4_engram_read_batch(&t, batch_ids, 1, STRIDE, batch) && errno == EDOM);
+    assert(!ds4_engram_read_batch(&t, batch_ids, 31, STRIDE, batch) && errno == EDOM);
     for (size_t part = 0; part < 4; part++) {
         uint32_t decode_ids[DS4_ENGRAM_COLS];
         for (size_t j = 0; j < DS4_ENGRAM_COLS; j++) decode_ids[j] = 2;
@@ -205,6 +206,7 @@ static void test_rows(void) {
     assert(ftruncate(fd, offset + 260) == 0);
     assert(!ds4_engram_read(&t, &bad, 1, out) && errno == EIO);
     assert(!ds4_engram_read_batch(&t, batch_ids, 1, STRIDE, batch) && errno == EIO);
+    assert(!ds4_engram_read_batch(&t, batch_ids, 31, STRIDE, batch) && errno == EIO);
     assert(!ds4_engram_read(&t, batch_ids, DS4_ENGRAM_COLS, batch) && errno == EIO);
     free(batch_ids);
     free(batch);
