@@ -63,3 +63,33 @@ The performance check uses `speed-bench/promessi_sposi.txt`, `--ctx-alloc 8257`,
 SSD streaming and the same calibrated V4.1 Q2 model recorded in the individual
 reports. This is one consolidation run. The SDK 15 build retains the two
 upstream unused Metal 4 symbol warnings.
+
+## Upstream alignment (2026-09-14)
+
+This branch now includes upstream
+`a04f46fa423e45712c8c7e430eff422479f314a3` (DeepSeek V4.1 CUDA support),
+the updated three optimization branches, and the existing raw completion mode.
+The single-host decode queue opt-in is explicitly macOS-only. Upstream's new
+non-macOS batched Engram reader and its error tests are preserved.
+
+Revalidation on the same M2 Ultra and exact Q2 model:
+
+- Metal and CPU builds, with freshly restored Metal executable links.
+- Frontend, Engram, V4.1 GGUF and quality-tool unit tests.
+- Real-model raw/default `/v1/completions`: JSON and SSE, with and without
+  `ignore_eos`, including trace verification of prompt rendering.
+- All three optimization flags enabled: 77.49 prefill t/s, 16.92 full decode
+  t/s across 512 tokens, 17.07 t/s after the first token. Output matches all
+  eight independent queue/Engram runs from this revalidation.
+  [Raw CSV](../speed-bench/fork_main_m2_ultra_20260914.csv).
+
+This is one combined performance run with the same 2,048-token prompt,
+8,257 allocated context, SSD streaming and automatic expert cache.
+Independent ABBA comparisons and parity evidence are in each optimization report.
+
+The complete Metal kernel suite is not green: the new router check fails at
+`tests/test_deepseek41_metal.c:105`, with exactly the same values on pristine
+upstream and all three PR branches. Seven targeted kernel subtests and the
+optimization-specific checks pass. No kernel or tolerance was changed.
+CUDA/ROCm hardware and full legacy `make test` were not run; the two existing
+SDK 15 unused Metal 4 symbol warnings remain.
