@@ -139,3 +139,16 @@ logit=-11.8886719 actual=0.00263455603 ref=0.00262947031
 No kernel or tolerance was changed to bypass it. The full kernel suite is
 therefore not green. CUDA/ROCm hardware and full legacy `make test` were not
 executed. The two existing SDK 15 unused Metal 4 symbol warnings remain.
+
+## Upstream integration (2026-09-15)
+
+Merged upstream `9139e2ae58a41503968a500f36f75895c1ba63fc` and retained both
+sets of test targets/documentation at the conflict. Clean Metal and CPU builds,
+frontend/Engram/V4.1 GGUF/quality-tool tests and the real-model session fixture
+with this optimization enabled pass. The session fixture ran with Metal API
+validation.
+Slab lifecycle and SSD expert/MoE kernel tests also pass.
+
+Performance numbers above are the 2026-09-14 measurements, not a new benchmark
+on this base. The unchanged upstream router failure is tracked by #1039 and
+the separate accuracy fix #1044; neither is bundled into this optimization.
