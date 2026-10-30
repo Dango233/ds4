@@ -13921,28 +13921,27 @@ static id<MTLBuffer> ds4_gpu_stream_expert_alloc_slab_buffer(
         !g_stream_expert_cache_mlock_relief_applied) {
 #if TARGET_OS_OSX
         if (@available(macOS 15.0, *)) {
-            const BOOL fresh = g_stream_slab_residency_set == nil;
-            if (fresh) {
+            /* Register only owned cache slabs, never disk-backed model views.
+             * Keep registration across slot reuse; clear the set with the slab
+             * pool after outstanding GPU work has drained. */
+            if (g_stream_slab_residency_set) {
+                [g_stream_slab_residency_set addAllocation:buffer];
+                [g_stream_slab_residency_set commit];
+            } else {
                 MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
                 desc.label = @"ds4_streaming_expert_slabs";
                 desc.initialCapacity = 64;
                 NSError *error = nil;
-                g_stream_slab_residency_set = [g_device newResidencySetWithDescriptor:desc error:&error];
-                if (!g_stream_slab_residency_set) {
-                    fprintf(stderr, "ds4: streaming slab residency set failed: %s\n",
+                id<MTLResidencySet> set = [g_device newResidencySetWithDescriptor:desc error:&error];
+                if (!set) {
+                    fprintf(stderr, "ds4: streaming slab residency set failed: %s; using unregistered slab\n",
                             [[error localizedDescription] UTF8String]);
-                    return nil;
+                    return buffer;
                 }
-            }
-            /* Only owned cache slabs belong here, never disk-backed model
-             * views. Keep registration across slot reuse; clear it with the
-             * physical slab pool after outstanding GPU work has drained.
-             * Queue attachment covers each submission without a separate
-             * explicit requestResidency lifetime. */
-            [g_stream_slab_residency_set addAllocation:buffer];
-            [g_stream_slab_residency_set commit];
-            if (fresh) {
-                [g_queue addResidencySet:g_stream_slab_residency_set];
+                [set addAllocation:buffer];
+                [set commit];
+                [g_queue addResidencySet:set];
+                g_stream_slab_residency_set = set;
             }
         }
 #endif
