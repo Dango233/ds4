@@ -46,7 +46,8 @@ To build weights rather than download them, see [GGUF tools](../gguf-tools/READM
 ## DeepSeek V4.1 Flash
 
 V4.1 Flash text and vision inference work on Metal. CUDA supports text with
-Q2 SSD streaming on one Spark or resident shards across two Sparks. It needs its own
+Q2 SSD streaming on one Spark or resident shards across two Sparks. ROCm
+supports single-host text inference with SSD streaming. It needs its own
 GGUF, tokenizer and inference graph; V4 Flash weights and DSpark support files
 are not interchangeable with it.
 
@@ -54,16 +55,19 @@ are not interchangeable with it.
 | --- | ---: | ---: |
 | `ds41f-q2` | 341 GiB | 152 GiB |
 | `ds41f-q4` | 483 GiB | 294 GiB |
+| `ds41f-mxfp4` | 467 GiB | 278 GiB |
 
-Both use imatrix-calibrated routed experts and include 189 GiB of Engram
-tables. Engram rows are read directly from the file as needed in every mode,
-never loaded as a resident table. Keep the GGUF on a fast local SSD.
+Q2 and Q4 use imatrix-calibrated routed experts; MXFP4 uses OCP MXFP4 routed
+experts with higher-precision attention, shared experts and output weights.
+All include 189 GiB of Engram tables. Engram rows are read directly from the
+file as needed in every mode, never loaded as a resident table. Keep the GGUF
+on a fast local SSD.
 
 On one 128 GB Mac, use SSD streaming. Leave the expert cache budget automatic:
 
 ```sh
 ./download_model.sh ds41f-q2
-./ds4 -m gguf/DeepSeek-V4.1-Flash-Q2.gguf \
+./ds4 -m gguf/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf \
   --ssd-streaming --ctx 32768
 ```
 
@@ -86,6 +90,23 @@ The download comes in two parts; the script joins and verifies them automaticall
 Allow another 37 GiB of free disk space while joining. Rerun the command to resume an
 interrupted download or join.
 
+For the 1017 MXFP4 build, run:
+
+```sh
+./download_model.sh ds41f-mxfp4
+```
+
+The target downloads all nine standard GGUF shards, verifies each size and
+SHA-256, and merges them into `gguf/DeepSeek-V4.1-Flash-1017-MXFP4-experts.gguf`.
+DwarfStar's V4.1 loader needs this single file with page-aligned Engram tables;
+the script restores the original 16 KiB alignment and verifies the original
+whole-file checksum before updating `ds4flash.gguf`. The shard files are kept,
+so allow about **935 GiB** for shards plus the merged output. Free space is
+checked before downloading. Rerun the same command to resume downloads or an
+interrupted merge; existing files and the previous default model are preserved
+if verification fails. Q2 and MXFP4 use the 1017 checkpoint; Q4 remains the
+previous release.
+
 Large SSD prefills process layers in wide batches. Metal overlaps computation
 with the next layer's reads; CUDA stages experts into its bounded device cache.
 Short appends keep using the expert cache.
@@ -94,8 +115,10 @@ Resident and TP inference also batch continued prefills automatically.
 For concurrent serving, see [session batching](SERVER.md#multiple-sessions).
 Each slot needs its own context memory; start with `--ctx 4096` before
 increasing both context and slot count. CUDA Q2 SSD mode batches up to eight
-decode rows; CUDA network TP currently serves sessions in order. DSpark,
-pipeline execution and ROCm are not implemented for V4.1; vision requires Metal.
+decode rows; CUDA network TP currently serves sessions in order.
+[DSpark](SPECULATIVE_DECODING.md#deepseek-v41-flash-dspark) uses a
+separate V4.1 support GGUF and currently requires one host. Pipeline execution
+is not implemented for V4.1; vision requires Metal.
 
 Scalar, batched and tensor-parallel execution are not numerically identical.
 Q4 batched prefill shows a small probability-score loss on the short official
@@ -107,7 +130,7 @@ For images, download the matching encoder and add it to the same command:
 
 ```sh
 ./download_model.sh ds41f-vision
-./ds4-agent -m gguf/DeepSeek-V4.1-Flash-Q2.gguf \
+./ds4-agent -m gguf/DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf \
   --ssd-streaming --vision gguf/DeepSeek-V4.1-Flash-Vision.gguf
 ```
 
@@ -116,6 +139,33 @@ on both TP ranks. Use `/read image.png` in `ds4`, `view_image` in `ds4-agent`,
 or the [server image API](SERVER.md#images). V4 Flash vision encoders do not
 work with V4.1. See [conversion](../gguf-tools/README.md#convert-deepseek-v41-flash)
 to build the GGUFs from safetensors.
+
+## Qwen3.8 Flash Next
+
+`./download_model.sh qwen38-q2` downloads one **137.10 GiB** GGUF: 41.73 GiB
+of main/MTP weights and 95.37 GiB of original BF16 n-grams kept on disk.
+Its gate/up experts use IQ2_XXS; down experts use Q2_K with 640 logical inputs
+padded to 768 in the weight file. It replaces the larger MXFP4-down IQ2 release.
+For 64 GB Macs, start at 8K context with a 1,024-token prefill chunk; runtime
+allocations add to the main weights, but the n-gram table is not mapped or
+preloaded. Keep the GGUF on a fast local SSD.
+The larger `qwen38-q4k` target uses 165.11 GiB on disk and 69.74 GiB for
+resident weights, before runtime buffers.
+This model runs on Metal and single-GPU CUDA, including DGX Spark.
+The script links `ds4flash.gguf` to the combined GGUF:
+
+```sh
+./ds4 --ctx 8192 --prefill-chunk 1024
+```
+
+Add `--mtp` for speculation; no second file is needed.
+See [Qwen setup](QWEN38_FLASH_NEXT.md)
+for memory, conversion, vision, and sampling details.
+
+Vision uses a separate encoder. `./download_model.sh qwen38-vision` downloads
+llama.cpp's Q8_0 mmproj from
+[ggml-org/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/ggml-org/Qwen3.8-Flash-Next-GGUF);
+pass it at runtime with `--vision`.
 
 ## GLM 5.3 Flash
 
@@ -207,3 +257,17 @@ be saved with `/save`.
 For two-Mac TP, pass the same encoder on both ranks. The coordinator encodes
 the image and sends the projected visual tokens to the worker.
 For HTTP image formats and limits, see [serving](SERVER.md#images).
+
+### Qwen3.8 Flash Next
+
+The text GGUF stays the same. Download and add the encoder explicitly:
+
+```sh
+./download_model.sh qwen38-vision
+./ds4 --mtp \
+  --vision gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf
+```
+
+The encoder is llama.cpp's Q8_0 mmproj conversion of the model's Qwen3-VL
+tower. Use `/read image.png` in `ds4` or `image_url` parts over HTTP; see
+[Qwen setup](QWEN38_FLASH_NEXT.md) for image limits and resize behavior.
