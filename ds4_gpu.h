@@ -3,6 +3,8 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "ds4_qwen4_vision.h"
+#include "ds4_gpu_copy.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -187,6 +189,54 @@ int ds4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size,
 int ds4_gpu_build_derived_artifacts_shard(const void *model_map, uint64_t model_size,
                                         uint64_t file_size,
                                         const char *model_path, uint32_t rank);
+/* CUDA network TP: each rank keeps half the intermediate dimension of every
+ * MXFP4 expert, read directly from the GGUF. Both ranks must use this layout.
+ * The arrays describe count expert tensors; is_down selects K halves rather
+ * than gate/up row halves. */
+/* Returns the allocated expert bytes, or zero on failure. */
+uint64_t ds4_gpu_build_mxfp4_tp_split(
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        file_size,
+        const char     *model_path,
+        uint32_t        rank,
+        const uint64_t *offsets,
+        const uint32_t *is_down,
+        const uint32_t *in_dims,
+        const uint32_t *out_dims,
+        const uint32_t *n_experts,
+        uint32_t        count);
+void ds4_gpu_release_mxfp4_tp_split(void);
+/* The same split for the lockstep DSpark drafter: IQ2_XXS gate/up and Q2_K
+ * down, or native MXFP4 experts. types holds each tensor's type. */
+uint64_t ds4_gpu_build_dspark_tp_split(
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        file_size,
+        const char     *model_path,
+        uint32_t        rank,
+        const uint64_t *offsets,
+        const uint32_t *is_down,
+        const uint32_t *in_dims,
+        const uint32_t *out_dims,
+        const uint32_t *n_experts,
+        const uint32_t *types,
+        uint32_t        count);
+void ds4_gpu_release_dspark_tp_split(void);
+
+/* CUDA side stream (single GPU).  ds4_gpu_side_begin() returns 1 when the
+ * following work is encoded on the side stream (ordered after all work
+ * already queued), 0 when unavailable (encode it on the main stream as
+ * usual) and -1 on error.  Every successful begin must be closed with
+ * ds4_gpu_side_end(); ds4_gpu_side_join() then orders the main stream after
+ * the side work and is a no-op once joined.  Not implemented on Metal/ROCm. */
+int ds4_gpu_side_begin(void);
+int ds4_gpu_side_end(void);
+int ds4_gpu_side_join(void);
+/* 1 when dense Q8_0 matmuls may be encoded in a side region beside main-stream
+ * Q8 work (no persistent activation scratch shared between the streams). */
+int ds4_gpu_side_dense_q8_ok(void);
+
 int ds4_gpu_model_range_replaced(const void *model_map, uint64_t offset,
                                  uint64_t bytes);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
@@ -267,6 +317,82 @@ static inline int ds4_gpu_device_is_m5_apple_silicon(void) { return 0; }
 #endif
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
+int ds4_gpu_qwen4_conv_stream_rows_tensor(
+        ds4_gpu_tensor *x, ds4_gpu_tensor *hist_pool,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        const uint32_t *slots, uint32_t n_rows, uint32_t n_channels,
+        uint32_t conv_kernel, uint32_t state_stride, uint32_t x_stride, int apply_silu);
+int ds4_gpu_qwen4_gdn_scan_rows_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *state_pool,
+        const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *ga, const ds4_gpu_tensor *gb,
+        const uint32_t *slots, uint32_t n_rows,
+        uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
+        uint32_t state_stride, uint32_t qkv_stride, uint32_t out_stride);
+/* One row of a Qwen3.8 decode batch for the attention rows kernels: the
+ * session's caches for the layer, its rope positions, its token position and
+ * whether it attends through the block selection or densely. */
+typedef struct {
+    ds4_gpu_tensor *k_cache, *v_cache, *ik_cache, *block_key;
+    const ds4_gpu_tensor *pos3;
+    uint32_t pos;
+    int use_sel;
+} ds4_gpu_qwen4_attn_row;
+#define DS4_GPU_QWEN4_ATTN_ROW_BYTES 64u   /* one staged table entry */
+/* One session of a decode batch for the GDN rows kernels: its state and
+ * history, optional snapshots of both after its first token, its first row
+ * and its row count (one or two). */
+typedef struct {
+    ds4_gpu_tensor *state, *hist, *snap_state, *snap_hist;
+    uint32_t row0, n_tok;
+} ds4_gpu_qwen4_gdn_row;
+#define DS4_GPU_QWEN4_GDN_ROW_BYTES 48u
+int ds4_gpu_qwen4_gdn_rows_stage(ds4_gpu_tensor *table, uint64_t entry0,
+                                 const ds4_gpu_qwen4_gdn_row *rows, uint32_t n_rows);
+int ds4_gpu_qwen4_gdn_scan_rows2_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *ga, const ds4_gpu_tensor *gb,
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_gdn_row *rows, uint32_t n_rows,
+        uint32_t n_batch_rows, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
+        uint32_t qkv_stride, uint32_t out_stride);
+int ds4_gpu_qwen4_conv_stream_rows2_tensor(
+        ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_gdn_row *rows, uint32_t n_rows,
+        uint32_t n_batch_rows, uint32_t n_channels, uint32_t conv_kernel, uint32_t x_stride, int apply_silu);
+int ds4_gpu_qwen4_attn_rows_stage(ds4_gpu_tensor *table, uint64_t entry0,
+                                  const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows, uint32_t ratio);
+int ds4_gpu_qwen4_attn_prep_rows_tensor(
+        ds4_gpu_tensor *q_out, ds4_gpu_tensor *gate_out, ds4_gpu_tensor *iq_out,
+        const ds4_gpu_tensor *qg, const ds4_gpu_tensor *kproj, const ds4_gpu_tensor *vproj,
+        const ds4_gpu_tensor *iq, const ds4_gpu_tensor *ik,
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
+        const void *model_map, uint64_t model_size,
+        uint64_t g_q_offset, uint64_t g_k_offset, uint64_t g_iq_offset,
+        uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
+        uint32_t n_idx_head, uint32_t idx_dim, float rope_base, float eps);
+int ds4_gpu_qwen4_idx_block_key_rows_tensor(
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
+        const void *model_map, uint64_t model_size, uint64_t g_ik_offset,
+        uint32_t ratio, uint32_t idx_dim, uint32_t n_rot, float rope_base, float eps);
+int ds4_gpu_qwen4_idx_score_rows_tensor(
+        ds4_gpu_tensor *score, ds4_gpu_tensor *tile_max, const ds4_gpu_tensor *iq,
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
+        uint32_t n_block_stride, uint32_t n_idx_head, uint32_t idx_dim, uint32_t ratio);
+int ds4_gpu_qwen4_idx_select_rows_tensor(
+        ds4_gpu_tensor *sel, const ds4_gpu_tensor *score, const ds4_gpu_tensor *tile_max,
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
+        uint32_t n_block_stride, uint32_t top_k);
+int ds4_gpu_qwen4_idx_expand_rows_tensor(
+        ds4_gpu_tensor *sel_tokens, ds4_gpu_tensor *n_sel, const ds4_gpu_tensor *sel_blocks,
+        const ds4_gpu_tensor *table, uint64_t entry0, uint32_t n_rows,
+        uint32_t n_sel_blocks, uint32_t ratio, uint32_t sel_stride);
+int ds4_gpu_qwen4_attn_decode_rows_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *sel_tokens, const ds4_gpu_tensor *n_sel, ds4_gpu_tensor *part,
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
+        uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t sel_stride, float scale);
+int ds4_gpu_qwen4_batch_mm_q8_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows);
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
@@ -534,6 +660,19 @@ int ds4_gpu_dspark_markov_argmax_tensor(ds4_gpu_tensor *out_idx,
                                         uint32_t prev_token,
                                         uint32_t vocab,
                                         uint32_t rank);
+/* CUDA TP drafter: score only rows [row0, row0 + rows) of the vocab; the
+ * logits tensor holds those rows and the key carries global token ids. */
+int ds4_gpu_dspark_markov_argmax_range_tensor(ds4_gpu_tensor *out_idx,
+                                              const ds4_gpu_tensor *logits_row,
+                                              const void *model_map,
+                                              uint64_t model_size,
+                                              uint64_t w1_offset,
+                                              uint64_t w2_offset,
+                                              uint32_t prev_token,
+                                              uint32_t vocab,
+                                              uint32_t row0,
+                                              uint32_t rows,
+                                              uint32_t rank);
 int ds4_gpu_indexer_topk_tensor(
         ds4_gpu_tensor       *selected,
         const ds4_gpu_tensor *scores,
@@ -594,8 +733,8 @@ int ds4_gpu_matmul_q8_0_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
-#if defined(__APPLE__)
-/* Qwen prefill: bounded Q8 unpack defaults on for M3 Ultra. */
+#if !defined(DS4_ROCM_BUILD)
+/* Qwen projections preserve FP32 activations on both GPU backends. */
 int ds4_gpu_qwen4_matmul_q8_0_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -1937,6 +2076,32 @@ int ds4_gpu_compressor_store_batch_tensor(
         uint32_t                pos0,
         uint32_t                n_tokens);
 
+/* Batched replay of the per-row compressor update for a short block of rows
+ * (n_rows <= 8; ratio 4, or a single-window ratio >= n_rows): stores every
+ * row, pools emitted rows into comp_cache rows comp_row0.., applies the
+ * ratio-4 shift, and writes snapshot t (state after row t) for t < n_snap.
+ * Bit-identical to calling ds4_gpu_compressor_update_tensor row by row and
+ * copying the state after each row; norm/rope/quantization of the pooled
+ * rows is left to the caller.  CUDA only. */
+int ds4_gpu_compressor_verify_rows_tensor(
+        const ds4_gpu_tensor *kv_rows,
+        const ds4_gpu_tensor *sc_rows,
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        ds4_gpu_tensor       *comp_cache,
+        uint32_t                comp_row0,
+        ds4_gpu_tensor       *snap_kv,
+        ds4_gpu_tensor       *snap_score,
+        uint32_t                n_snap,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                pos0,
+        uint32_t                n_rows);
+
 int ds4_gpu_compressor_prefill_tensor(
         ds4_gpu_tensor       *comp_cache,
         ds4_gpu_tensor       *state_kv,
@@ -2589,6 +2754,13 @@ int ds4_gpu_dspark_gfx1151_fast_path(void);
 void ds4_gpu_set_dspark_verify_mode(bool enabled);
 #elif !defined(__APPLE__)
 int ds4_gpu_device_is_spark(void);
+/* Spark: the spans as batched launches on the decode stream, ordered like
+ * the asynchronous tensor copies.  Returns 1 when queued; 0 when declined
+ * without copying anything (another device, more than
+ * DS4_GPU_COPY_SPANS_MAX spans, a span outside its tensors or over 4 GiB,
+ * spans on different devices, or any destination overlapping another span):
+ * the caller then copies them one by one; -1 on a launch error. */
+int ds4_gpu_tensor_copy_spans(const ds4_gpu_copy_span *spans, uint32_t n);
 #endif
 
 int ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(
@@ -2823,6 +2995,39 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps,
         float                   norm_eps);
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+/* Spark: complete HC pre boundary from the raw F32 HC state for 1..8 rows:
+ * F16 mixer with the RMS factor applied after it, split, weighted sum and
+ * output norm.  Deterministic, but not bit-identical to RMSNorm + F16 mixer +
+ * split.  scratch (>= 26 * n_hc * n_embd / 256 floats per row, e.g. the
+ * graph's HC RMS buffer) is consumed within the call; its contents are
+ * undefined after.  Outputs must not overlap the state, the scratch or each
+ * other, except norm_out == out.  Returns 1 when launched, 0 when unsupported
+ * or disabled (DS4_CUDA_DISABLE_HC_PRE_FUSED, DS4_CUDA_DISABLE_HC_SPLIT_NORM_FUSED,
+ * DS4_CUDA_SERIAL_F16_MATMUL, DS4_CUDA_NO_F16_CUBLAS_BATCH; outputs
+ * untouched), -1 on a launch failure. */
+int ds4_gpu_hc_pre_f32_mix_split_norm_tensor(
+        ds4_gpu_tensor       *mix,
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *split,
+        ds4_gpu_tensor       *scratch,
+        const ds4_gpu_tensor *residual_hc,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              mix_weight_offset,
+        uint64_t              scale_offset,
+        uint64_t              base_offset,
+        uint64_t              norm_weight_offset,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              n_rows,
+        uint32_t              sinkhorn_iters,
+        float                 eps,
+        float                 hc_eps,
+        float                 norm_eps);
+#endif
 
 int ds4_gpu_hc_rms_norm_mix_f16_available(void);
 int ds4_gpu_hc_rms_norm_mix_f16_tensor(
@@ -3397,6 +3602,18 @@ int ds4_gpu_qwen4_moe_down_tensor(
         uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
         uint32_t ff_dim, uint32_t out_dim,
         uint64_t shared_down_offset, uint32_t shared_type);
+int ds4_gpu_qwen4_moe_mid_grouped_tensor(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts, uint32_t list_cap,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t in_dim, uint32_t ff_dim);
+int ds4_gpu_qwen4_moe_down_grouped_tensor(
+        ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts, uint32_t list_cap,
+        const void *model_map, uint64_t model_size, uint64_t down_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t ff_dim, uint32_t out_dim);
 /* shared_gate NULL: no shared expert; shared NULL: the shared output is part
  * slot n_slots, otherwise `shared` [T][dim] holds it.  part_stride = slots per
  * token in part. */
@@ -3428,18 +3645,6 @@ int ds4_gpu_qwen4_gdn_front_tensor(
         uint32_t weight_type, uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
         uint32_t conv_kernel, uint32_t in_dim, ds4_gpu_tensor *snap_state, uint32_t snap_tok,
         ds4_gpu_tensor *snap2_state, uint32_t snap2_tok);
-#define DS4_QWEN4_VISION_LAYERS 27
-typedef struct {
-    uint64_t ln1_w, ln1_b, qkv_w, qkv_b, out_w, out_b, ln2_w, ln2_b, up_w, up_b, down_w, down_b;
-    uint32_t qkv_type, out_type, up_type, down_type;
-} ds4_qwen4_vision_layer_weights;
-typedef struct {
-    uint64_t patch_w0, patch_w1, patch_b, pos_embd, post_ln_w, post_ln_b, mm0_w, mm0_b, mm2_w, mm2_b;
-    uint32_t mm0_type, mm2_type, patch_type;
-    uint32_t n_embd, n_ff, n_head, n_patch, n_merge, n_pos_side, n_out;
-    float eps;
-    ds4_qwen4_vision_layer_weights layer[DS4_QWEN4_VISION_LAYERS];
-} ds4_qwen4_vision_weights;
 /* Encode one image: patches [n_patches][3*P*P] in 2x2 window order plus the
  * resampled position embedding [n_patches][n_embd]; out receives
  * [n_patches/4][n_out].  Weights are read from the mapped mmproj GGUF. */
