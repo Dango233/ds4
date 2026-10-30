@@ -8,6 +8,44 @@ bool ds4_log_is_tty(FILE *fp) {
     return false;
 }
 
+/* Fail only residency creation; buffer allocation still uses the real device. */
+@interface SlabResidencyFailureDevice : NSObject
+@property(nonatomic, strong) id<MTLDevice> device;
+@end
+@implementation SlabResidencyFailureDevice
+- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
+    return [self.device newBufferWithLength:length options:options];
+}
+- (id<MTLResidencySet>)newResidencySetWithDescriptor:(MTLResidencySetDescriptor *)descriptor
+                                            error:(NSError **)error API_AVAILABLE(macos(15.0)) {
+    (void)descriptor;
+    if (error) *error = [NSError errorWithDomain:@"slab-residency-test" code:1 userInfo:nil];
+    return nil;
+}
+@end
+
+static void check_residency_creation_failure(void) {
+    if (@available(macOS 15.0, *)) {
+        assert(!g_stream_slab_residency_set);
+        id<MTLDevice> real_device = g_device;
+        SlabResidencyFailureDevice *failure = [SlabResidencyFailureDevice new];
+        failure.device = real_device;
+        g_device = (id<MTLDevice>)failure;
+        id<MTLBuffer> buffer = ds4_gpu_stream_expert_alloc_slab_buffer(4096, @"failure fallback");
+        g_device = real_device;
+        assert(buffer && !g_stream_slab_residency_set);
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
+        [enc fillBuffer:buffer range:NSMakeRange(0, 4096) value:23];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        assert(cb.status == MTLCommandBufferStatusCompleted);
+        assert(((const unsigned char *)buffer.contents)[4095] == 23);
+        puts("Metal slab residency: creation failure returns a usable buffer: PASS");
+    }
+}
+
 static void add_slot(uint32_t expert) {
     const uint64_t part_bytes = 256u * 1024u;
     id<MTLBuffer> gate = nil, up = nil, down = nil;
@@ -57,6 +95,7 @@ int main(void) {
             setenv("DS4_METAL_STREAMING_EXPERT_SLAB_MB", "16", 1);
             ds4_gpu_set_ssd_streaming(true);
             ds4_gpu_set_streaming_expert_cache_budget(32);
+            check_residency_creation_failure();
             __weak id old_set = nil;
             __weak id old_buffer = nil;
             @autoreleasepool {
